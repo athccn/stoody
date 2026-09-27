@@ -175,28 +175,28 @@ export default function StoodyApp() {
   }, [])
 
   // 4. Session & Auth listener
-  useEffect(() => {
-    const fetchSession = async () => {
-      const { data: { session } } = await supabase.auth.getSession()
-      setUser(session?.user ?? null)
-      if (session?.user?.id) {
-        loadUserAnalytics(session.user.id)
-      }
-      loadLeaderboardData()
+ useEffect(() => {
+  const fetchSession = async () => {
+    const { data: { user } } = await supabase.auth.getUser()
+    setUser(user ?? null)
+    if (user?.id) {
+      loadUserAnalytics(user.id)
     }
-    fetchSession()
+    loadLeaderboardData()
+  }
+  fetchSession()
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null)
-      if (session?.user?.id) {
-        loadUserAnalytics(session.user.id)
-      }
-      loadLeaderboardData()
-    })
+  const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const activeUser = session?.user ?? null
+    setUser(activeUser)
+    if (activeUser?.id) {
+      loadUserAnalytics(activeUser.id)
+    }
+    loadLeaderboardData()
+  })
 
-    return () => subscription.unsubscribe()
-  }, [loadUserAnalytics, loadLeaderboardData])
-
+  return () => subscription.unsubscribe()
+}, [loadUserAnalytics, loadLeaderboardData])
   // 5. Supabase Realtime Presence Channel
   useEffect(() => {
     const channel = supabase.channel('stoody-live-presence', {
