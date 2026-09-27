@@ -26,6 +26,8 @@ interface HeatMapDay {
   dateKey: string
   minutes: number
   level: number
+  isFuture: boolean
+  dayOfWeek: number
 }
 
 interface PresenceUser {
@@ -110,7 +112,7 @@ export default function StoodyApp() {
       osc.start()
       osc.stop(audioCtx.currentTime + 0.8)
     } catch {
-      // AudioContext policy fallback
+      // AudioContext policy suppression fallback
     }
   }, [])
 
@@ -268,7 +270,7 @@ export default function StoodyApp() {
     }
   }, [user, subject, mode, loadUserAnalytics, loadLeaderboardData])
 
-  // 7. Synchronize input boxes with seconds whenever timer updates
+  // 7. Synchronize inputs with timer seconds
   useEffect(() => {
     if (mode !== 'stopwatch') {
       const mins = Math.floor(timeLeft / 60)
@@ -376,26 +378,44 @@ export default function StoodyApp() {
     return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
   }
 
-  // 11. Heat Map Grid generator: 18 Weeks (clean, centered, and non-scrolling)
+  // 11. Calendar-Aligned Heat Map: 20 Full Calendar Weeks (Sunday-Saturday)
   const heatMapDays = useMemo(() => {
     const days: HeatMapDay[] = []
-    const totalWeeks = 18
-    const totalDays = totalWeeks * 7
+    const totalWeeks = 20
     const today = new Date()
+    const todayKey = today.toISOString().split('T')[0]
+    const currentDayOfWeek = today.getDay() // 0 = Sunday, 6 = Saturday
 
-    for (let i = totalDays - 1; i >= 0; i--) {
-      const d = new Date()
-      d.setDate(today.getDate() - i)
+    // End of the current week (Saturday)
+    const endOfWeek = new Date(today)
+    endOfWeek.setDate(today.getDate() + (6 - currentDayOfWeek))
+
+    // Start of the grid (Sunday, totalWeeks ago)
+    const startOfGrid = new Date(endOfWeek)
+    startOfGrid.setDate(endOfWeek.getDate() - (totalWeeks * 7 - 1))
+
+    for (let i = 0; i < totalWeeks * 7; i++) {
+      const d = new Date(startOfGrid)
+      d.setDate(startOfGrid.getDate() + i)
       const dateKey = d.toISOString().split('T')[0]
-      const mins = analyticsData.dailyBreakdown[dateKey] || 0
-      
-      let level = 0
-      if (mins > 0 && mins <= 30) level = 1
-      else if (mins > 30 && mins <= 60) level = 2
-      else if (mins > 60 && mins <= 120) level = 3
-      else if (mins > 120) level = 4
+      const isFuture = dateKey > todayKey
+      const mins = isFuture ? 0 : (analyticsData.dailyBreakdown[dateKey] || 0)
 
-      days.push({ dateKey, minutes: mins, level })
+      let level = 0
+      if (!isFuture) {
+        if (mins > 0 && mins <= 30) level = 1
+        else if (mins > 30 && mins <= 60) level = 2
+        else if (mins > 60 && mins <= 120) level = 3
+        else if (mins > 120) level = 4
+      }
+
+      days.push({
+        dateKey,
+        minutes: mins,
+        level,
+        isFuture,
+        dayOfWeek: d.getDay()
+      })
     }
     return days
   }, [analyticsData.dailyBreakdown])
@@ -712,7 +732,6 @@ export default function StoodyApp() {
                       const cy = 120 - (p.hours / maxVal) * 100 - 10
                       return (
                         <g key={idx} className="cursor-pointer">
-                          {/* Larger invisible hover target */}
                           <circle
                             cx={cx}
                             cy={cy}
@@ -742,7 +761,7 @@ export default function StoodyApp() {
               </div>
             </div>
 
-            {/* Centered, Non-Scrolling Study Heat Map */}
+            {/* Calendar-Aligned Study Heat Map */}
             <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-6">
               <div className="flex items-center justify-between mb-4">
                 <div>
@@ -752,28 +771,51 @@ export default function StoodyApp() {
                   </p>
                 </div>
                 <div className="text-xs text-zinc-400 bg-zinc-900 px-3 py-1.5 rounded-lg border border-zinc-800 font-mono">
-                  Recent Weeks
+                  Weekly Layout
                 </div>
               </div>
               
               <div className="w-full flex justify-center py-2">
-                <div className="grid grid-flow-col grid-rows-7 gap-1.5">
-                  {heatMapDays.map((day, i) => {
-                    const colorClasses = [
-                      'bg-zinc-900 hover:bg-zinc-800 border border-zinc-800/60',
-                      'bg-emerald-950 border border-emerald-900',
-                      'bg-emerald-800',
-                      'bg-emerald-600',
-                      'bg-emerald-400 ring-2 ring-emerald-300/40',
-                    ]
-                    return (
-                      <div
-                        key={i}
-                        title={`${day.dateKey}: ${day.minutes}m focus time`}
-                        className={`w-3.5 h-3.5 rounded-[3px] transition cursor-pointer hover:scale-110 ${colorClasses[day.level]}`}
-                      />
-                    )
-                  })}
+                <div className="flex gap-2">
+                  {/* Day of Week Labels */}
+                  <div className="grid grid-rows-7 gap-1.5 text-[9px] text-zinc-500 font-mono select-none h-max">
+                    <span className="h-3.5 flex items-center">Sun</span>
+                    <span className="h-3.5 flex items-center">Mon</span>
+                    <span className="h-3.5 flex items-center">Tue</span>
+                    <span className="h-3.5 flex items-center">Wed</span>
+                    <span className="h-3.5 flex items-center">Thu</span>
+                    <span className="h-3.5 flex items-center">Fri</span>
+                    <span className="h-3.5 flex items-center">Sat</span>
+                  </div>
+
+                  {/* Calendar Matrix */}
+                  <div className="grid grid-flow-col grid-rows-7 gap-1.5">
+                    {heatMapDays.map((day, i) => {
+                      if (day.isFuture) {
+                        return (
+                          <div
+                            key={i}
+                            className="w-3.5 h-3.5 rounded-[3px] bg-zinc-900/30 border border-zinc-800/20 opacity-40 pointer-events-none"
+                          />
+                        )
+                      }
+
+                      const colorClasses = [
+                        'bg-zinc-900 hover:bg-zinc-800 border border-zinc-800/60',
+                        'bg-emerald-950 border border-emerald-900',
+                        'bg-emerald-800',
+                        'bg-emerald-600',
+                        'bg-emerald-400 ring-2 ring-emerald-300/40',
+                      ]
+                      return (
+                        <div
+                          key={i}
+                          title={`${day.dateKey}: ${day.minutes}m focus time`}
+                          className={`w-3.5 h-3.5 rounded-[3px] transition cursor-pointer hover:scale-110 ${colorClasses[day.level]}`}
+                        />
+                      )
+                    })}
+                  </div>
                 </div>
               </div>
 
