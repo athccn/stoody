@@ -16,8 +16,7 @@ import {
   LogOut,
   Calendar,
   Clock,
-  Target,
-  Volume2
+  Target
 } from 'lucide-react'
 
 type Mode = 'pomodoro' | 'timer' | 'break' | 'stopwatch'
@@ -64,6 +63,15 @@ export default function StoodyApp() {
   const [saveStatus, setSaveStatus] = useState<string>('')
   const [activeLeaderboardTab, setActiveLeaderboardTab] = useState<'weekly' | 'streak'>('weekly')
 
+  // Hover Tooltip for Spline Graph
+  const [hoveredPoint, setHoveredPoint] = useState<{
+    label: string
+    hours: number
+    dateKey: string
+    x: number
+    y: number
+  } | null>(null)
+
   // Realtime Presence & Leaderboard state
   const [onlineUsers, setOnlineUsers] = useState<Record<string, PresenceUser>>({})
   const [leaderboardUsers, setLeaderboardUsers] = useState<LeaderboardUser[]>([])
@@ -86,7 +94,7 @@ export default function StoodyApp() {
   const timerRef = useRef<NodeJS.Timeout | null>(null)
   const presenceChannelRef = useRef<any>(null)
 
-  // 1. Synthesize soft audio notification on completion
+  // 1. Audio chime on timer completion
   const playCompletionChime = useCallback(() => {
     try {
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
@@ -102,11 +110,11 @@ export default function StoodyApp() {
       osc.start()
       osc.stop(audioCtx.currentTime + 0.8)
     } catch {
-      // AudioContext policy suppression fallback
+      // AudioContext policy fallback
     }
   }, [])
 
-  // 2. Fetch User Analytics from Supabase
+  // 2. Fetch User Analytics
   const loadUserAnalytics = useCallback(async (userId: string) => {
     const { data: sessions, error } = await supabase
       .from('study_sessions')
@@ -174,30 +182,31 @@ export default function StoodyApp() {
     setLeaderboardUsers(formatted)
   }, [])
 
-  // 4. Session & Auth listener
- useEffect(() => {
-  const fetchSession = async () => {
-    const { data: { user } } = await supabase.auth.getUser()
-    setUser(user ?? null)
-    if (user?.id) {
-      loadUserAnalytics(user.id)
+  // 4. Session & Auth Listener
+  useEffect(() => {
+    const fetchSession = async () => {
+      const { data: { user } } = await supabase.auth.getUser()
+      setUser(user ?? null)
+      if (user?.id) {
+        loadUserAnalytics(user.id)
+      }
+      loadLeaderboardData()
     }
-    loadLeaderboardData()
-  }
-  fetchSession()
+    fetchSession()
 
-  const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-    const activeUser = session?.user ?? null
-    setUser(activeUser)
-    if (activeUser?.id) {
-      loadUserAnalytics(activeUser.id)
-    }
-    loadLeaderboardData()
-  })
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      const activeUser = session?.user ?? null
+      setUser(activeUser)
+      if (activeUser?.id) {
+        loadUserAnalytics(activeUser.id)
+      }
+      loadLeaderboardData()
+    })
 
-  return () => subscription.unsubscribe()
-}, [loadUserAnalytics, loadLeaderboardData])
-  // 5. Supabase Realtime Presence Channel
+    return () => subscription.unsubscribe()
+  }, [loadUserAnalytics, loadLeaderboardData])
+
+  // 5. Supabase Realtime Presence
   useEffect(() => {
     const channel = supabase.channel('stoody-live-presence', {
       config: { presence: { key: user?.id || 'guest-' + Math.random().toString(36).substring(7) } }
@@ -232,7 +241,7 @@ export default function StoodyApp() {
     }
   }, [user, isRunning, subject])
 
-  // 6. Automated session logger
+  // 6. Automated Session Logger
   const autoLogSession = useCallback(async (durationMinutes: number) => {
     if (durationMinutes <= 0) return
 
@@ -367,10 +376,11 @@ export default function StoodyApp() {
     return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
   }
 
-  // 11. Heat Map Grid generator
+  // 11. Heat Map Grid generator: 18 Weeks (clean, centered, and non-scrolling)
   const heatMapDays = useMemo(() => {
     const days: HeatMapDay[] = []
-    const totalDays = 52 * 7
+    const totalWeeks = 18
+    const totalDays = totalWeeks * 7
     const today = new Date()
 
     for (let i = totalDays - 1; i >= 0; i--) {
@@ -654,24 +664,37 @@ export default function StoodyApp() {
               </div>
             </div>
 
-            {/* Smoothed Purple Spline Card */}
-            <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-6">
+            {/* Study Activity Curve with Hover Tooltip */}
+            <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-6 relative">
               <div className="flex items-center justify-between mb-4">
                 <div>
                   <h3 className="text-base font-semibold text-white">Study Activity</h3>
-                  <p className="text-xs text-zinc-400 mt-0.5">Daily focus time over the last 14 days</p>
+                  <p className="text-xs text-zinc-400 mt-0.5">Daily focus time over the last 14 days (hover nodes for stats)</p>
                 </div>
                 <div className="flex gap-1 bg-zinc-900 p-1 rounded-xl border border-zinc-800 text-[11px]">
                   <span className="px-2.5 py-1 rounded-lg bg-zinc-800 text-white font-medium">14D</span>
                 </div>
               </div>
               
-              <div className="h-44 w-full pt-4">
+              <div className="h-48 w-full pt-4 relative">
+                {/* Floating Tooltip */}
+                {hoveredPoint && (
+                  <div
+                    className="absolute z-20 pointer-events-none transform -translate-x-1/2 -translate-y-full mb-2 bg-zinc-900 border border-purple-500/40 shadow-xl px-3 py-1.5 rounded-lg text-center backdrop-blur-md"
+                    style={{ left: `${(hoveredPoint.x / 500) * 100}%`, top: `${(hoveredPoint.y / 120) * 100}%` }}
+                  >
+                    <div className="text-[10px] text-zinc-400 font-mono">{hoveredPoint.label}</div>
+                    <div className="text-xs font-bold text-purple-300">
+                      {Math.floor(hoveredPoint.hours)}h {Math.round((hoveredPoint.hours % 1) * 60)}m
+                    </div>
+                  </div>
+                )}
+
                 {analyticsData.splinePoints.length > 0 ? (
                   <svg viewBox="0 0 500 120" className="w-full h-full overflow-visible">
                     <defs>
                       <linearGradient id="purpleGlow" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor="#a855f7" stopOpacity="0.25" />
+                        <stop offset="0%" stopColor="#a855f7" stopOpacity="0.3" />
                         <stop offset="100%" stopColor="#a855f7" stopOpacity="0.0" />
                       </linearGradient>
                     </defs>
@@ -687,10 +710,26 @@ export default function StoodyApp() {
                       const step = 500 / (analyticsData.splinePoints.length - 1)
                       const cx = idx * step
                       const cy = 120 - (p.hours / maxVal) * 100 - 10
-                      if (p.hours === 0) return null
                       return (
-                        <g key={idx}>
-                          <circle cx={cx} cy={cy} r="4" fill="#c084fc" />
+                        <g key={idx} className="cursor-pointer">
+                          {/* Larger invisible hover target */}
+                          <circle
+                            cx={cx}
+                            cy={cy}
+                            r="14"
+                            fill="transparent"
+                            onMouseEnter={() => setHoveredPoint({ ...p, x: cx, y: cy })}
+                            onMouseLeave={() => setHoveredPoint(null)}
+                          />
+                          <circle
+                            cx={cx}
+                            cy={cy}
+                            r={hoveredPoint?.dateKey === p.dateKey ? "6" : "4"}
+                            fill={hoveredPoint?.dateKey === p.dateKey ? "#e9d5ff" : "#c084fc"}
+                            stroke="#6b21a8"
+                            strokeWidth={hoveredPoint?.dateKey === p.dateKey ? "2" : "1"}
+                            className="transition-all duration-150 pointer-events-none"
+                          />
                         </g>
                       )
                     })}
@@ -703,25 +742,25 @@ export default function StoodyApp() {
               </div>
             </div>
 
-            {/* 52-Week Emerald Heat Map */}
+            {/* Centered, Non-Scrolling Study Heat Map */}
             <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-6">
               <div className="flex items-center justify-between mb-4">
                 <div>
                   <h3 className="text-base font-semibold text-white">Study Heat Map</h3>
                   <p className="text-xs text-zinc-400 mt-0.5">
-                    {Math.floor(analyticsData.totalMinutes / 60)}h {Math.round(analyticsData.totalMinutes % 60)}m · {analyticsData.sessionCount} sessions · {analyticsData.activeDaysCount} active days
+                    {Math.floor(analyticsData.totalMinutes / 60)}h {Math.round(analyticsData.totalMinutes % 60)}m logged across {analyticsData.activeDaysCount} active days
                   </p>
                 </div>
                 <div className="text-xs text-zinc-400 bg-zinc-900 px-3 py-1.5 rounded-lg border border-zinc-800 font-mono">
-                  2026
+                  Recent Weeks
                 </div>
               </div>
               
-              <div className="overflow-x-auto pb-2">
-                <div className="grid grid-flow-col grid-rows-7 gap-1.5 w-max">
+              <div className="w-full flex justify-center py-2">
+                <div className="grid grid-flow-col grid-rows-7 gap-1.5">
                   {heatMapDays.map((day, i) => {
                     const colorClasses = [
-                      'bg-zinc-900/90 hover:bg-zinc-800 border border-zinc-800/40',
+                      'bg-zinc-900 hover:bg-zinc-800 border border-zinc-800/60',
                       'bg-emerald-950 border border-emerald-900',
                       'bg-emerald-800',
                       'bg-emerald-600',
@@ -730,8 +769,8 @@ export default function StoodyApp() {
                     return (
                       <div
                         key={i}
-                        title={`${day.dateKey}: ${day.minutes}m`}
-                        className={`w-3.5 h-3.5 rounded-[3px] transition ${colorClasses[day.level]}`}
+                        title={`${day.dateKey}: ${day.minutes}m focus time`}
+                        className={`w-3.5 h-3.5 rounded-[3px] transition cursor-pointer hover:scale-110 ${colorClasses[day.level]}`}
                       />
                     )
                   })}
