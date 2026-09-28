@@ -17,9 +17,7 @@ import {
   Calendar,
   Clock,
   Target,
-  Sparkles,
   ShieldCheck,
-  CheckCircle2,
   Users,
   TrendingUp
 } from 'lucide-react'
@@ -132,12 +130,10 @@ export default function StoodyApp() {
 
   // 2. Fetch Leaderboard Data
   const loadLeaderboardData = useCallback(async () => {
-    // Fetch all registered profiles
     const { data: profiles, error: pErr } = await supabase
       .from('profiles')
       .select('id, username, avatar_url, current_streak')
 
-    // Fetch public sessions to aggregate totals
     const { data: sessions, error: sErr } = await supabase
       .from('study_sessions')
       .select('user_id, duration_minutes')
@@ -192,7 +188,6 @@ export default function StoodyApp() {
         streak++
         checkDate.setDate(checkDate.getDate() - 1)
       } else {
-        // If today has no study sessions yet, check if yesterday was active
         if (streak === 0) {
           checkDate.setDate(checkDate.getDate() - 1)
           const yKey = checkDate.toISOString().split('T')[0]
@@ -207,7 +202,6 @@ export default function StoodyApp() {
     }
     const finalStreak = Math.max(streak, 1)
 
-    // Sync streak with Supabase profile table so leaderboard reflects it
     await supabase.from('profiles').update({ current_streak: finalStreak }).eq('id', userId)
 
     const points: { label: string; hours: number; dateKey: string }[] = []
@@ -232,7 +226,7 @@ export default function StoodyApp() {
     loadLeaderboardData()
   }, [loadLeaderboardData])
 
-  // 4. Session & Auth Listener (Persists Logins Across Sessions)
+  // 4. Session & Auth Listener
   useEffect(() => {
     const fetchSession = async () => {
       try {
@@ -240,7 +234,6 @@ export default function StoodyApp() {
         const activeUser = session?.user ?? null
         setUser(activeUser)
         if (activeUser?.id) {
-          // Ensure profile entry exists
           await supabase.from('profiles').upsert({
             id: activeUser.id,
             username: activeUser.user_metadata?.full_name || activeUser.email?.split('@')[0] || 'Student',
@@ -540,11 +533,9 @@ export default function StoodyApp() {
   if (!user) {
     return (
       <div className="min-h-screen bg-[#09090b] text-zinc-100 flex flex-col items-center justify-center p-6 selection:bg-purple-600/30 relative overflow-hidden">
-        {/* Ambient Subtle Radial Glow */}
         <div className="absolute w-[500px] h-[500px] bg-purple-600/10 rounded-full blur-[140px] pointer-events-none -top-20" />
         
         <div className="max-w-md w-full bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-8 backdrop-blur-2xl shadow-2xl relative z-10 space-y-7">
-          {/* Top Brand Mark */}
           <div className="flex flex-col items-center text-center space-y-3">
             <div className="relative">
               <div className="absolute -inset-1 rounded-2xl bg-gradient-to-tr from-purple-600 to-indigo-500 opacity-30 blur-md" />
@@ -558,7 +549,6 @@ export default function StoodyApp() {
             </div>
           </div>
 
-          {/* Interactive Feature Preview Cards */}
           <div className="space-y-2.5">
             <div className="flex items-center gap-3 p-3 rounded-xl bg-zinc-950/50 border border-zinc-800/50">
               <div className="w-8 h-8 rounded-lg bg-orange-500/10 border border-orange-500/20 flex items-center justify-center text-orange-400 shrink-0">
@@ -591,7 +581,6 @@ export default function StoodyApp() {
             </div>
           </div>
 
-          {/* Google Auth Button */}
           <div className="space-y-3 pt-1">
             <button
               onClick={handleGoogleLogin}
@@ -993,19 +982,19 @@ export default function StoodyApp() {
               <div className="flex gap-1 bg-zinc-900 p-1 rounded-xl border border-zinc-800 text-xs">
                 <button
                   onClick={() => setActiveLeaderboardTab('weekly')}
-                  className={`px-3 py-1.5 rounded-lg font-medium transition[cite: 2] ${
+                  className={`px-3 py-1.5 rounded-lg font-medium transition ${
                     activeLeaderboardTab === 'weekly' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
-                  Total Focus[cite: 2]
+                  Total Focus
                 </button>
                 <button
                   onClick={() => setActiveLeaderboardTab('streak')}
-                  className={`px-3 py-1.5 rounded-lg font-medium transition[cite: 2] ${
+                  className={`px-3 py-1.5 rounded-lg font-medium transition ${
                     activeLeaderboardTab === 'streak' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
-                  Streaks 🔥[cite: 2]
+                  Streaks 🔥
                 </button>
               </div>
             </div>
@@ -1037,7 +1026,7 @@ export default function StoodyApp() {
                         </div>
                         <div>
                           <div className="text-sm font-semibold text-white">
-                            {lbUser.username} {isCurrent && '(You)'}[cite: 2]
+                            {lbUser.username} {isCurrent && '(You)'}
                           </div>
                           {studyingNow ? (
                             <div className="flex items-center gap-1.5 text-xs text-emerald-400 font-medium">
@@ -1047,7 +1036,7 @@ export default function StoodyApp() {
                           ) : (
                             <div className="flex items-center gap-1.5 text-xs text-zinc-500">
                               <span className={`w-2 h-2 rounded-full ${isOnline ? 'bg-amber-400' : 'bg-zinc-600'}`} />
-                              {isOnline ? 'Idle' : 'Offline'}[cite: 2]
+                              {isOnline ? 'Idle' : 'Offline'}
                             </div>
                           )}
                         </div>
@@ -1056,7 +1045,7 @@ export default function StoodyApp() {
                         <div className="text-sm font-bold text-white">
                           {Math.floor(lbUser.total_minutes / 60)}h {Math.round(lbUser.total_minutes % 60)}m
                         </div>
-                        <div className="text-xs text-orange-400 font-medium">🔥 {lbUser.streak} Days[cite: 2]</div>
+                        <div className="text-xs text-orange-400 font-medium">🔥 {lbUser.streak} Days</div>
                       </div>
                     </div>
                   )
