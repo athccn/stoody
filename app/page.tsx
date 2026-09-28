@@ -16,7 +16,12 @@ import {
   LogOut,
   Calendar,
   Clock,
-  Target
+  Target,
+  Sparkles,
+  ShieldCheck,
+  CheckCircle2,
+  Users,
+  TrendingUp
 } from 'lucide-react'
 
 type Mode = 'pomodoro' | 'timer' | 'break' | 'stopwatch'
@@ -24,10 +29,10 @@ type View = 'dashboard' | 'analytics' | 'leaderboard'
 
 interface HeatMapDay {
   dateKey: string
+  label: string
   minutes: number
   level: number
-  isFuture: boolean
-  dayOfWeek: number
+  isToday: boolean
 }
 
 interface PresenceUser {
@@ -51,6 +56,7 @@ interface LeaderboardUser {
 
 export default function StoodyApp() {
   const [user, setUser] = useState<any>(null)
+  const [authLoading, setAuthLoading] = useState<boolean>(true)
   const [currentView, setCurrentView] = useState<View>('dashboard')
   
   // Timer & Editable State
@@ -74,27 +80,35 @@ export default function StoodyApp() {
     y: number
   } | null>(null)
 
+  // Hover Tooltip for Heat Map
+  const [hoveredHeatDay, setHoveredHeatDay] = useState<HeatMapDay | null>(null)
+
   // Realtime Presence & Leaderboard state
   const [onlineUsers, setOnlineUsers] = useState<Record<string, PresenceUser>>({})
   const [leaderboardUsers, setLeaderboardUsers] = useState<LeaderboardUser[]>([])
+
+  // Tab-Throttling Proof Timestamps
+  const targetEndRef = useRef<number | null>(null)
+  const stopwatchStartRef = useRef<number | null>(null)
+  const timerRef = useRef<NodeJS.Timeout | null>(null)
+  const presenceChannelRef = useRef<any>(null)
 
   // Analytics State
   const [analyticsData, setAnalyticsData] = useState<{
     totalMinutes: number
     sessionCount: number
     activeDaysCount: number
+    currentStreak: number
     dailyBreakdown: Record<string, number>
     splinePoints: { label: string; hours: number; dateKey: string }[]
   }>({
     totalMinutes: 0,
     sessionCount: 0,
     activeDaysCount: 0,
+    currentStreak: 1,
     dailyBreakdown: {},
     splinePoints: [],
   })
-
-  const timerRef = useRef<NodeJS.Timeout | null>(null)
-  const presenceChannelRef = useRef<any>(null)
 
   // 1. Audio chime on timer completion
   const playCompletionChime = useCallback(() => {
@@ -116,7 +130,40 @@ export default function StoodyApp() {
     }
   }, [])
 
-  // 2. Fetch User Analytics
+  // 2. Fetch Leaderboard Data
+  const loadLeaderboardData = useCallback(async () => {
+    // Fetch all registered profiles
+    const { data: profiles, error: pErr } = await supabase
+      .from('profiles')
+      .select('id, username, avatar_url, current_streak')
+
+    // Fetch public sessions to aggregate totals
+    const { data: sessions, error: sErr } = await supabase
+      .from('study_sessions')
+      .select('user_id, duration_minutes')
+
+    if (pErr || !profiles) return
+
+    const userTotals: Record<string, number> = {}
+    if (sessions && !sErr) {
+      sessions.forEach((s) => {
+        userTotals[s.user_id] = (userTotals[s.user_id] || 0) + Number(s.duration_minutes || 0)
+      })
+    }
+
+    const formatted: LeaderboardUser[] = profiles.map((p) => ({
+      id: p.id,
+      username: p.username || 'Anonymous',
+      avatar_url: p.avatar_url,
+      total_minutes: userTotals[p.id] || 0,
+      streak: p.current_streak && p.current_streak > 0 ? p.current_streak : 1
+    }))
+
+    formatted.sort((a, b) => b.total_minutes - a.total_minutes)
+    setLeaderboardUsers(formatted)
+  }, [])
+
+  // 3. Calculate streak and load user analytics
   const loadUserAnalytics = useCallback(async (userId: string) => {
     const { data: sessions, error } = await supabase
       .from('study_sessions')
@@ -136,6 +183,33 @@ export default function StoodyApp() {
       dailyMap[dayKey] = (dailyMap[dayKey] || 0) + mins
     })
 
+    // Compute active consecutive day streak
+    let streak = 0
+    const checkDate = new Date()
+    while (true) {
+      const key = checkDate.toISOString().split('T')[0]
+      if (dailyMap[key] && dailyMap[key] > 0) {
+        streak++
+        checkDate.setDate(checkDate.getDate() - 1)
+      } else {
+        // If today has no study sessions yet, check if yesterday was active
+        if (streak === 0) {
+          checkDate.setDate(checkDate.getDate() - 1)
+          const yKey = checkDate.toISOString().split('T')[0]
+          if (dailyMap[yKey] && dailyMap[yKey] > 0) {
+            streak++
+            checkDate.setDate(checkDate.getDate() - 1)
+            continue
+          }
+        }
+        break
+      }
+    }
+    const finalStreak = Math.max(streak, 1)
+
+    // Sync streak with Supabase profile table so leaderboard reflects it
+    await supabase.from('profiles').update({ current_streak: finalStreak }).eq('id', userId)
+
     const points: { label: string; hours: number; dateKey: string }[] = []
     for (let i = 13; i >= 0; i--) {
       const d = new Date()
@@ -150,59 +224,52 @@ export default function StoodyApp() {
       totalMinutes: totalMins,
       sessionCount: sessions.length,
       activeDaysCount: Object.keys(dailyMap).length,
+      currentStreak: finalStreak,
       dailyBreakdown: dailyMap,
       splinePoints: points,
     })
-  }, [])
 
-  // 3. Fetch Leaderboard Data
-  const loadLeaderboardData = useCallback(async () => {
-    const { data: profiles } = await supabase
-      .from('profiles')
-      .select('id, username, avatar_url, current_streak')
+    loadLeaderboardData()
+  }, [loadLeaderboardData])
 
-    const { data: sessions } = await supabase
-      .from('study_sessions')
-      .select('user_id, duration_minutes')
-
-    if (!profiles) return
-
-    const userTotals: Record<string, number> = {}
-    sessions?.forEach((s) => {
-      userTotals[s.user_id] = (userTotals[s.user_id] || 0) + Number(s.duration_minutes || 0)
-    })
-
-    const formatted: LeaderboardUser[] = profiles.map((p) => ({
-      id: p.id,
-      username: p.username || 'Anonymous',
-      avatar_url: p.avatar_url,
-      total_minutes: userTotals[p.id] || 0,
-      streak: p.current_streak || 1
-    }))
-
-    formatted.sort((a, b) => b.total_minutes - a.total_minutes)
-    setLeaderboardUsers(formatted)
-  }, [])
-
-  // 4. Session & Auth Listener
+  // 4. Session & Auth Listener (Persists Logins Across Sessions)
   useEffect(() => {
     const fetchSession = async () => {
-      const { data: { user } } = await supabase.auth.getUser()
-      setUser(user ?? null)
-      if (user?.id) {
-        loadUserAnalytics(user.id)
+      try {
+        const { data: { session } } = await supabase.auth.getSession()
+        const activeUser = session?.user ?? null
+        setUser(activeUser)
+        if (activeUser?.id) {
+          // Ensure profile entry exists
+          await supabase.from('profiles').upsert({
+            id: activeUser.id,
+            username: activeUser.user_metadata?.full_name || activeUser.email?.split('@')[0] || 'Student',
+            avatar_url: activeUser.user_metadata?.avatar_url || ''
+          }, { onConflict: 'id' })
+
+          loadUserAnalytics(activeUser.id)
+        }
+        loadLeaderboardData()
+      } finally {
+        setAuthLoading(false)
       }
-      loadLeaderboardData()
     }
     fetchSession()
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
       const activeUser = session?.user ?? null
       setUser(activeUser)
       if (activeUser?.id) {
+        await supabase.from('profiles').upsert({
+          id: activeUser.id,
+          username: activeUser.user_metadata?.full_name || activeUser.email?.split('@')[0] || 'Student',
+          avatar_url: activeUser.user_metadata?.avatar_url || ''
+        }, { onConflict: 'id' })
+
         loadUserAnalytics(activeUser.id)
       }
       loadLeaderboardData()
+      setAuthLoading(false)
     })
 
     return () => subscription.unsubscribe()
@@ -210,8 +277,10 @@ export default function StoodyApp() {
 
   // 5. Supabase Realtime Presence
   useEffect(() => {
+    if (!user?.id) return
+
     const channel = supabase.channel('stoody-live-presence', {
-      config: { presence: { key: user?.id || 'guest-' + Math.random().toString(36).substring(7) } }
+      config: { presence: { key: user.id } }
     })
 
     channel
@@ -227,8 +296,8 @@ export default function StoodyApp() {
       .subscribe(async (status) => {
         if (status === 'SUBSCRIBED') {
           await channel.track({
-            userId: user?.id || 'guest',
-            name: user?.user_metadata?.full_name || 'Guest User',
+            userId: user.id,
+            name: user.user_metadata?.full_name || user.email?.split('@')[0] || 'Student',
             isStudying: isRunning,
             subject: subject,
             startedAt: isRunning ? Date.now() : undefined
@@ -245,30 +314,24 @@ export default function StoodyApp() {
 
   // 6. Automated Session Logger
   const autoLogSession = useCallback(async (durationMinutes: number) => {
-    if (durationMinutes <= 0) return
+    if (durationMinutes <= 0 || !user?.id) return
 
-    const { data: { session } } = await supabase.auth.getSession()
-    const currentUser = session?.user ?? user
+    setSaveStatus('Saving session...')
+    const { error } = await supabase.from('study_sessions').insert({
+      user_id: user.id,
+      duration_minutes: durationMinutes,
+      subject: subject || 'General',
+      mode: mode,
+    })
 
-    if (currentUser) {
-      setSaveStatus('Saving session...')
-      const { error } = await supabase.from('study_sessions').insert({
-        user_id: currentUser.id,
-        duration_minutes: durationMinutes,
-        subject: subject || 'General',
-        mode: mode,
-      })
-
-      if (!error) {
-        setSaveStatus(`Logged ${durationMinutes}m automatically!`)
-        loadUserAnalytics(currentUser.id)
-        loadLeaderboardData()
-        setTimeout(() => setSaveStatus(''), 4000)
-      } else {
-        setSaveStatus('Failed to sync session')
-      }
+    if (!error) {
+      setSaveStatus(`Logged ${durationMinutes}m automatically!`)
+      loadUserAnalytics(user.id)
+      setTimeout(() => setSaveStatus(''), 4000)
+    } else {
+      setSaveStatus('Failed to sync session')
     }
-  }, [user, subject, mode, loadUserAnalytics, loadLeaderboardData])
+  }, [user, subject, mode, loadUserAnalytics])
 
   // 7. Synchronize inputs with timer seconds
   useEffect(() => {
@@ -304,6 +367,8 @@ export default function StoodyApp() {
   // 9. Mode switch logic
   const switchMode = (newMode: Mode) => {
     setIsRunning(false)
+    targetEndRef.current = null
+    stopwatchStartRef.current = null
     setMode(newMode)
     if (newMode === 'pomodoro') {
       setCustomMinutes(25)
@@ -318,27 +383,40 @@ export default function StoodyApp() {
     }
   }
 
-  // 10. Timer ticking loop
+  // 10. Accurate Timestamp-Driven Ticking Loop
   useEffect(() => {
     if (isRunning) {
+      if (mode === 'stopwatch') {
+        stopwatchStartRef.current = Date.now() - stopwatchElapsed * 1000
+      } else {
+        targetEndRef.current = Date.now() + timeLeft * 1000
+      }
+
       timerRef.current = setInterval(() => {
         if (mode === 'stopwatch') {
-          setStopwatchElapsed((prev) => prev + 1)
+          if (stopwatchStartRef.current) {
+            const elapsed = Math.floor((Date.now() - stopwatchStartRef.current) / 1000)
+            setStopwatchElapsed(elapsed)
+          }
         } else {
-          setTimeLeft((prev) => {
-            if (prev <= 1) {
+          if (targetEndRef.current) {
+            const remaining = Math.max(0, Math.ceil((targetEndRef.current - Date.now()) / 1000))
+            setTimeLeft(remaining)
+
+            if (remaining <= 0) {
               clearInterval(timerRef.current!)
               setIsRunning(false)
+              targetEndRef.current = null
               playCompletionChime()
               autoLogSession(customMinutes)
-              return 0
             }
-            return prev - 1
-          })
+          }
         }
-      }, 1000)
+      }, 250)
     } else {
       if (timerRef.current) clearInterval(timerRef.current)
+      targetEndRef.current = null
+      stopwatchStartRef.current = null
     }
 
     return () => {
@@ -365,6 +443,8 @@ export default function StoodyApp() {
 
   const resetTimer = () => {
     setIsRunning(false)
+    targetEndRef.current = null
+    stopwatchStartRef.current = null
     if (mode === 'stopwatch') {
       setStopwatchElapsed(0)
     } else {
@@ -378,43 +458,43 @@ export default function StoodyApp() {
     return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
   }
 
-  // 11. Calendar-Aligned Heat Map: 20 Full Calendar Weeks (Sunday-Saturday)
+  const handleGoogleLogin = () => {
+    supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: `${window.location.origin}/auth/callback`,
+      },
+    })
+  }
+
+  // 11. Rolling Heat Map ending on Today
   const heatMapDays = useMemo(() => {
     const days: HeatMapDay[] = []
     const totalWeeks = 20
     const today = new Date()
     const todayKey = today.toISOString().split('T')[0]
-    const currentDayOfWeek = today.getDay() // 0 = Sunday, 6 = Saturday
-
-    // End of the current week (Saturday)
-    const endOfWeek = new Date(today)
-    endOfWeek.setDate(today.getDate() + (6 - currentDayOfWeek))
-
-    // Start of the grid (Sunday, totalWeeks ago)
-    const startOfGrid = new Date(endOfWeek)
-    startOfGrid.setDate(endOfWeek.getDate() - (totalWeeks * 7 - 1))
-
-    for (let i = 0; i < totalWeeks * 7; i++) {
-      const d = new Date(startOfGrid)
-      d.setDate(startOfGrid.getDate() + i)
+    const dayOfWeek = today.getDay()
+    const totalDays = totalWeeks * 7 + (dayOfWeek + 1)
+    
+    for (let i = totalDays - 1; i >= 0; i--) {
+      const d = new Date()
+      d.setDate(today.getDate() - i)
       const dateKey = d.toISOString().split('T')[0]
-      const isFuture = dateKey > todayKey
-      const mins = isFuture ? 0 : (analyticsData.dailyBreakdown[dateKey] || 0)
+      const mins = analyticsData.dailyBreakdown[dateKey] || 0
+      const isToday = dateKey === todayKey
 
       let level = 0
-      if (!isFuture) {
-        if (mins > 0 && mins <= 30) level = 1
-        else if (mins > 30 && mins <= 60) level = 2
-        else if (mins > 60 && mins <= 120) level = 3
-        else if (mins > 120) level = 4
-      }
+      if (mins > 0 && mins <= 30) level = 1
+      else if (mins > 30 && mins <= 60) level = 2
+      else if (mins > 60 && mins <= 120) level = 3
+      else if (mins > 120) level = 4
 
       days.push({
         dateKey,
+        label: d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
         minutes: mins,
         level,
-        isFuture,
-        dayOfWeek: d.getDay()
+        isToday
       })
     }
     return days
@@ -446,6 +526,97 @@ export default function StoodyApp() {
     }, '')
   }, [analyticsData.splinePoints])
 
+  // Loading Screen
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-[#09090b] flex flex-col items-center justify-center text-zinc-400">
+        <div className="w-8 h-8 border-2 border-purple-500/20 border-t-purple-500 rounded-full animate-spin mb-4" />
+        <p className="text-xs font-mono tracking-wider text-zinc-500">AUTHENTICATING...</p>
+      </div>
+    )
+  }
+
+  // DIRECTION 3: MINIMALIST AESTHETIC LANDING CARD
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-[#09090b] text-zinc-100 flex flex-col items-center justify-center p-6 selection:bg-purple-600/30 relative overflow-hidden">
+        {/* Ambient Subtle Radial Glow */}
+        <div className="absolute w-[500px] h-[500px] bg-purple-600/10 rounded-full blur-[140px] pointer-events-none -top-20" />
+        
+        <div className="max-w-md w-full bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-8 backdrop-blur-2xl shadow-2xl relative z-10 space-y-7">
+          {/* Top Brand Mark */}
+          <div className="flex flex-col items-center text-center space-y-3">
+            <div className="relative">
+              <div className="absolute -inset-1 rounded-2xl bg-gradient-to-tr from-purple-600 to-indigo-500 opacity-30 blur-md" />
+              <div className="relative w-12 h-12 rounded-2xl bg-zinc-950 border border-zinc-800 flex items-center justify-center font-bold text-lg text-purple-400">
+                S
+              </div>
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight text-white">Stoody</h1>
+              <p className="text-xs text-zinc-400 mt-1">Your personal study hub & live accountability tracker.</p>
+            </div>
+          </div>
+
+          {/* Interactive Feature Preview Cards */}
+          <div className="space-y-2.5">
+            <div className="flex items-center gap-3 p-3 rounded-xl bg-zinc-950/50 border border-zinc-800/50">
+              <div className="w-8 h-8 rounded-lg bg-orange-500/10 border border-orange-500/20 flex items-center justify-center text-orange-400 shrink-0">
+                <Flame className="w-4 h-4 fill-orange-500/20" />
+              </div>
+              <div className="text-left">
+                <div className="text-xs font-semibold text-zinc-200">Streaks & Auto-Persistence</div>
+                <div className="text-[11px] text-zinc-500">Sessions automatically sync to your cloud streak</div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3 p-3 rounded-xl bg-zinc-950/50 border border-zinc-800/50">
+              <div className="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 shrink-0">
+                <Users className="w-4 h-4" />
+              </div>
+              <div className="text-left">
+                <div className="text-xs font-semibold text-zinc-200">Real-Time Presence</div>
+                <div className="text-[11px] text-zinc-500">See when your friends are live in active focus</div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3 p-3 rounded-xl bg-zinc-950/50 border border-zinc-800/50">
+              <div className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400 shrink-0">
+                <TrendingUp className="w-4 h-4" />
+              </div>
+              <div className="text-left">
+                <div className="text-xs font-semibold text-zinc-200">Rolling Heat Maps</div>
+                <div className="text-[11px] text-zinc-500">Clean contribution grid tracking your consistency</div>
+              </div>
+            </div>
+          </div>
+
+          {/* Google Auth Button */}
+          <div className="space-y-3 pt-1">
+            <button
+              onClick={handleGoogleLogin}
+              className="w-full flex items-center justify-center gap-3 py-3 px-4 rounded-xl bg-white hover:bg-zinc-100 text-zinc-950 font-semibold text-xs tracking-wide transition shadow-lg shadow-white/5 active:scale-[0.98]"
+            >
+              <svg className="w-4 h-4" viewBox="0 0 24 24">
+                <path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.6h6.5c-.3 1.5-1.1 2.8-2.4 3.7l3.7 2.9c2.2-2 3.7-5 3.7-8.9z"/>
+                <path fill="#34A853" d="M12 23c3.2 0 6-1.1 8-3l-3.7-2.9c-1.1.7-2.5 1.2-4.3 1.2-3.1 0-5.8-2.3-6.7-5.3L1.6 16c1.9 3.8 5.8 7 10.4 7z"/>
+                <path fill="#FBBC05" d="M5.3 14.7c-.2-.7-.4-1.5-.4-2.3s.2-1.6.4-2.3L1.6 7.2C.6 9.2 0 11.5 0 14s.6 4.8 1.6 6.8l3.7-2.9z"/>
+                <path fill="#EA4335" d="M12 5c1.6 0 3 .6 4.1 1.7l3.1-3.1C17.3 1.8 14.8 1 12 1 7.4 1 3.5 3.6 1.6 7.4l3.7 2.9C6.2 7.3 8.9 5 12 5z"/>
+              </svg>
+              Continue with Google
+            </button>
+
+            <div className="flex items-center justify-center gap-1.5 text-[11px] text-zinc-500">
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>Signed in once, remembered automatically</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // APP DASHBOARD
   return (
     <div className="min-h-screen bg-[#09090b] text-zinc-100 flex flex-col font-sans selection:bg-purple-600/30">
       {/* Top Navbar */}
@@ -491,34 +662,17 @@ export default function StoodyApp() {
         </div>
 
         {/* Auth / Account Controls */}
-        <div>
-          {user ? (
-            <div className="flex items-center gap-3">
-              <span className="text-xs text-zinc-300 hidden sm:inline font-medium">
-                {user.user_metadata?.full_name || user.email}
-              </span>
-              <button
-                onClick={() => supabase.auth.signOut().then(() => setUser(null))}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-xs font-medium text-zinc-300 transition"
-              >
-                <LogOut className="w-3.5 h-3.5" />
-                Sign Out
-              </button>
-            </div>
-          ) : (
-            <button
-              onClick={() => supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: `${window.location.origin}/auth/callback` } })}
-              className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-zinc-100 hover:bg-white text-zinc-950 text-xs font-semibold transition shadow"
-            >
-              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24">
-                <path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.6h6.5c-.3 1.5-1.1 2.8-2.4 3.7l3.7 2.9c2.2-2 3.7-5 3.7-8.9z"/>
-                <path fill="#34A853" d="M12 23c3.2 0 6-1.1 8-3l-3.7-2.9c-1.1.7-2.5 1.2-4.3 1.2-3.1 0-5.8-2.3-6.7-5.3L1.6 16c1.9 3.8 5.8 7 10.4 7z"/>
-                <path fill="#FBBC05" d="M5.3 14.7c-.2-.7-.4-1.5-.4-2.3s.2-1.6.4-2.3L1.6 7.2C.6 9.2 0 11.5 0 14s.6 4.8 1.6 6.8l3.7-2.9z"/>
-                <path fill="#EA4335" d="M12 5c1.6 0 3 .6 4.1 1.7l3.1-3.1C17.3 1.8 14.8 1 12 1 7.4 1 3.5 3.6 1.6 7.4l3.7 2.9C6.2 7.3 8.9 5 12 5z"/>
-              </svg>
-              Sign In with Google
-            </button>
-          )}
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-zinc-300 hidden sm:inline font-medium">
+            {user.user_metadata?.full_name || user.email}
+          </span>
+          <button
+            onClick={() => supabase.auth.signOut().then(() => setUser(null))}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-xs font-medium text-zinc-300 transition"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            Sign Out
+          </button>
         </div>
       </header>
 
@@ -535,12 +689,12 @@ export default function StoodyApp() {
                 </div>
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className="text-xl font-bold text-white">{analyticsData.activeDaysCount} Days</span>
+                    <span className="text-xl font-bold text-white">{analyticsData.currentStreak} Days</span>
                     <span className="text-xs bg-orange-500/20 text-orange-300 font-medium px-2 py-0.5 rounded-full border border-orange-500/30">
-                      Active Days
+                      Active Streak
                     </span>
                   </div>
-                  <p className="text-xs text-zinc-400 mt-0.5">Focus block running with automated persistence.</p>
+                  <p className="text-xs text-zinc-400 mt-0.5">Consecutive daily study streak synced with leaderboard.</p>
                 </div>
               </div>
               {saveStatus && (
@@ -672,9 +826,9 @@ export default function StoodyApp() {
               </div>
 
               <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-2xl p-4">
-                <div className="text-zinc-500 text-xs flex items-center gap-1.5 mb-1"><Flame className="w-3.5 h-3.5 text-orange-400" /> Active Days</div>
-                <div className="text-2xl font-bold text-white">{analyticsData.activeDaysCount} Days</div>
-                <div className="text-zinc-500 text-[11px] mt-1">Total recorded</div>
+                <div className="text-zinc-500 text-xs flex items-center gap-1.5 mb-1"><Flame className="w-3.5 h-3.5 text-orange-400" /> Active Streak</div>
+                <div className="text-2xl font-bold text-white">{analyticsData.currentStreak} Days</div>
+                <div className="text-zinc-500 text-[11px] mt-1">Daily consistency</div>
               </div>
 
               <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-2xl p-4">
@@ -697,7 +851,6 @@ export default function StoodyApp() {
               </div>
               
               <div className="h-48 w-full pt-4 relative">
-                {/* Floating Tooltip */}
                 {hoveredPoint && (
                   <div
                     className="absolute z-20 pointer-events-none transform -translate-x-1/2 -translate-y-full mb-2 bg-zinc-900 border border-purple-500/40 shadow-xl px-3 py-1.5 rounded-lg text-center backdrop-blur-md"
@@ -761,7 +914,7 @@ export default function StoodyApp() {
               </div>
             </div>
 
-            {/* Calendar-Aligned Study Heat Map */}
+            {/* Rolling Heat Map */}
             <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-6">
               <div className="flex items-center justify-between mb-4">
                 <div>
@@ -771,13 +924,12 @@ export default function StoodyApp() {
                   </p>
                 </div>
                 <div className="text-xs text-zinc-400 bg-zinc-900 px-3 py-1.5 rounded-lg border border-zinc-800 font-mono">
-                  Weekly Layout
+                  Rolling 20 Weeks
                 </div>
               </div>
               
               <div className="w-full flex justify-center py-2">
                 <div className="flex gap-2">
-                  {/* Day of Week Labels */}
                   <div className="grid grid-rows-7 gap-1.5 text-[9px] text-zinc-500 font-mono select-none h-max">
                     <span className="h-3.5 flex items-center">Sun</span>
                     <span className="h-3.5 flex items-center">Mon</span>
@@ -788,18 +940,8 @@ export default function StoodyApp() {
                     <span className="h-3.5 flex items-center">Sat</span>
                   </div>
 
-                  {/* Calendar Matrix */}
                   <div className="grid grid-flow-col grid-rows-7 gap-1.5">
                     {heatMapDays.map((day, i) => {
-                      if (day.isFuture) {
-                        return (
-                          <div
-                            key={i}
-                            className="w-3.5 h-3.5 rounded-[3px] bg-zinc-900/30 border border-zinc-800/20 opacity-40 pointer-events-none"
-                          />
-                        )
-                      }
-
                       const colorClasses = [
                         'bg-zinc-900 hover:bg-zinc-800 border border-zinc-800/60',
                         'bg-emerald-950 border border-emerald-900',
@@ -810,8 +952,11 @@ export default function StoodyApp() {
                       return (
                         <div
                           key={i}
-                          title={`${day.dateKey}: ${day.minutes}m focus time`}
-                          className={`w-3.5 h-3.5 rounded-[3px] transition cursor-pointer hover:scale-110 ${colorClasses[day.level]}`}
+                          onMouseEnter={() => setHoveredHeatDay(day)}
+                          onMouseLeave={() => setHoveredHeatDay(null)}
+                          className={`w-3.5 h-3.5 rounded-[3px] transition cursor-pointer hover:scale-125 ${
+                            day.isToday ? 'ring-1 ring-white/60' : ''
+                          } ${colorClasses[day.level]}`}
                         />
                       )
                     })}
@@ -819,14 +964,19 @@ export default function StoodyApp() {
                 </div>
               </div>
 
-              <div className="flex items-center justify-end gap-1.5 text-[11px] text-zinc-500 mt-3">
-                <span>Less</span>
-                <span className="w-2.5 h-2.5 rounded-[2px] bg-zinc-900 border border-zinc-800" />
-                <span className="w-2.5 h-2.5 rounded-[2px] bg-emerald-950" />
-                <span className="w-2.5 h-2.5 rounded-[2px] bg-emerald-800" />
-                <span className="w-2.5 h-2.5 rounded-[2px] bg-emerald-600" />
-                <span className="w-2.5 h-2.5 rounded-[2px] bg-emerald-400" />
-                <span>More</span>
+              <div className="flex items-center justify-between text-[11px] text-zinc-500 mt-3 pt-3 border-t border-zinc-800/50">
+                <span className="font-mono text-zinc-400">
+                  {hoveredHeatDay ? `${hoveredHeatDay.label}: ${hoveredHeatDay.minutes}m focus time` : 'Hover a cell to see day stats'}
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <span>Less</span>
+                  <span className="w-2.5 h-2.5 rounded-[2px] bg-zinc-900 border border-zinc-800" />
+                  <span className="w-2.5 h-2.5 rounded-[2px] bg-emerald-950" />
+                  <span className="w-2.5 h-2.5 rounded-[2px] bg-emerald-800" />
+                  <span className="w-2.5 h-2.5 rounded-[2px] bg-emerald-600" />
+                  <span className="w-2.5 h-2.5 rounded-[2px] bg-emerald-400" />
+                  <span>More</span>
+                </div>
               </div>
             </div>
           </div>
@@ -843,71 +993,74 @@ export default function StoodyApp() {
               <div className="flex gap-1 bg-zinc-900 p-1 rounded-xl border border-zinc-800 text-xs">
                 <button
                   onClick={() => setActiveLeaderboardTab('weekly')}
-                  className={`px-3 py-1.5 rounded-lg font-medium transition ${
+                  className={`px-3 py-1.5 rounded-lg font-medium transition[cite: 2] ${
                     activeLeaderboardTab === 'weekly' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
-                  Total Focus
+                  Total Focus[cite: 2]
                 </button>
                 <button
                   onClick={() => setActiveLeaderboardTab('streak')}
-                  className={`px-3 py-1.5 rounded-lg font-medium transition ${
+                  className={`px-3 py-1.5 rounded-lg font-medium transition[cite: 2] ${
                     activeLeaderboardTab === 'streak' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
-                  Streaks 🔥
+                  Streaks 🔥[cite: 2]
                 </button>
               </div>
             </div>
 
             <div className="rounded-2xl bg-zinc-900/40 border border-zinc-800/80 overflow-hidden divide-y divide-zinc-800/60">
-              {leaderboardUsers.map((lbUser, index) => {
-                const presence = onlineUsers[lbUser.id]
-                const isCurrent = user?.id === lbUser.id
-                const isOnline = Boolean(presence)
-                const studyingNow = presence?.isStudying ?? (isCurrent && isRunning)
-                const activeSubj = presence?.subject || (isCurrent ? subject : 'General')
+              {leaderboardUsers
+                .slice()
+                .sort((a, b) => activeLeaderboardTab === 'weekly' ? b.total_minutes - a.total_minutes : b.streak - a.streak)
+                .map((lbUser, index) => {
+                  const presence = onlineUsers[lbUser.id]
+                  const isCurrent = user?.id === lbUser.id
+                  const isOnline = Boolean(presence)
+                  const studyingNow = presence?.isStudying ?? (isCurrent && isRunning)
+                  const activeSubj = presence?.subject || (isCurrent ? subject : 'General')
 
-                return (
-                  <div
-                    key={lbUser.id}
-                    className={`p-4 flex items-center justify-between transition ${
-                      isCurrent ? 'bg-purple-950/20 border-l-2 border-purple-500' : 'hover:bg-zinc-900/30'
-                    }`}
-                  >
-                    <div className="flex items-center gap-3">
-                      <span className="text-sm font-bold w-5">
-                        {index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `${index + 1}`}
-                      </span>
-                      <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-purple-600 to-indigo-500 flex items-center justify-center font-bold text-xs text-white uppercase">
-                        {lbUser.username.slice(0, 2)}
-                      </div>
-                      <div>
-                        <div className="text-sm font-semibold text-white">
-                          {lbUser.username} {isCurrent && '(You)'}
+                  return (
+                    <div
+                      key={lbUser.id}
+                      className={`p-4 flex items-center justify-between transition ${
+                        isCurrent ? 'bg-purple-950/20 border-l-2 border-purple-500' : 'hover:bg-zinc-900/30'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className="text-sm font-bold w-5">
+                          {index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `${index + 1}`}
+                        </span>
+                        <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-purple-600 to-indigo-500 flex items-center justify-center font-bold text-xs text-white uppercase">
+                          {lbUser.username.slice(0, 2)}
                         </div>
-                        {studyingNow ? (
-                          <div className="flex items-center gap-1.5 text-xs text-emerald-400 font-medium">
-                            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                            Focusing on {activeSubj}
+                        <div>
+                          <div className="text-sm font-semibold text-white">
+                            {lbUser.username} {isCurrent && '(You)'}[cite: 2]
                           </div>
-                        ) : (
-                          <div className="flex items-center gap-1.5 text-xs text-zinc-500">
-                            <span className={`w-2 h-2 rounded-full ${isOnline ? 'bg-amber-400' : 'bg-zinc-600'}`} />
-                            {isOnline ? 'Idle' : 'Offline'}
-                          </div>
-                        )}
+                          {studyingNow ? (
+                            <div className="flex items-center gap-1.5 text-xs text-emerald-400 font-medium">
+                              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                              Focusing on {activeSubj}
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-1.5 text-xs text-zinc-500">
+                              <span className={`w-2 h-2 rounded-full ${isOnline ? 'bg-amber-400' : 'bg-zinc-600'}`} />
+                              {isOnline ? 'Idle' : 'Offline'}[cite: 2]
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-sm font-bold text-white">
+                          {Math.floor(lbUser.total_minutes / 60)}h {Math.round(lbUser.total_minutes % 60)}m
+                        </div>
+                        <div className="text-xs text-orange-400 font-medium">🔥 {lbUser.streak} Days[cite: 2]</div>
                       </div>
                     </div>
-                    <div className="text-right">
-                      <div className="text-sm font-bold text-white">
-                        {Math.floor(lbUser.total_minutes / 60)}h {Math.round(lbUser.total_minutes % 60)}m
-                      </div>
-                      <div className="text-xs text-orange-400 font-medium">🔥 {lbUser.streak} Days</div>
-                    </div>
-                  </div>
-                )
-              })}
+                  )
+                })}
             </div>
           </div>
         )}
