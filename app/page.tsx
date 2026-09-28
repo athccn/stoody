@@ -20,7 +20,10 @@ import {
   Target,
   ShieldCheck,
   Users,
-  TrendingUp
+  TrendingUp,
+  Sparkles,
+  Sun,
+  Moon
 } from 'lucide-react'
 
 type EngineMode = 'pomodoro' | 'timer' | 'stopwatch'
@@ -54,6 +57,22 @@ interface LeaderboardUser {
   current_subject?: string
 }
 
+interface SessionLog {
+  id: string
+  duration_minutes: number
+  subject: string
+  mode: string
+  created_at: string
+}
+
+interface DayBar {
+  dayLabel: string
+  dateKey: string
+  minutes: number
+  hours: number
+  isToday: boolean
+}
+
 export default function StoodyApp() {
   const [user, setUser] = useState<any>(null)
   const [authLoading, setAuthLoading] = useState<boolean>(true)
@@ -75,7 +94,7 @@ export default function StoodyApp() {
   const [saveStatus, setSaveStatus] = useState<string>('')
   const [activeLeaderboardTab, setActiveLeaderboardTab] = useState<'weekly' | 'streak'>('weekly')
 
-  // Hover Tooltip for Spline Graph
+  // Hover Tooltips
   const [hoveredPoint, setHoveredPoint] = useState<{
     label: string
     hours: number
@@ -83,9 +102,8 @@ export default function StoodyApp() {
     x: number
     y: number
   } | null>(null)
-
-  // Hover Tooltip for Heat Map
   const [hoveredHeatDay, setHoveredHeatDay] = useState<HeatMapDay | null>(null)
+  const [hoveredBar, setHoveredBar] = useState<DayBar | null>(null)
 
   // Realtime Presence & Leaderboard state
   const [onlineUsers, setOnlineUsers] = useState<Record<string, PresenceUser>>({})
@@ -104,14 +122,20 @@ export default function StoodyApp() {
     activeDaysCount: number
     currentStreak: number
     dailyBreakdown: Record<string, number>
+    todayHoursDistribution: number[] // 24 hours of today
+    recentSessions: SessionLog[]
     splinePoints: { label: string; hours: number; dateKey: string }[]
+    sevenDayBars: DayBar[]
   }>({
     totalMinutes: 0,
     sessionCount: 0,
     activeDaysCount: 0,
     currentStreak: 1,
     dailyBreakdown: {},
+    todayHoursDistribution: new Array(24).fill(0),
+    recentSessions: [],
     splinePoints: [],
+    sevenDayBars: []
   })
 
   const isBreakActive = engineMode === 'pomodoro' && pomoPhase !== 'work'
@@ -167,11 +191,11 @@ export default function StoodyApp() {
     setLeaderboardUsers(formatted)
   }, [])
 
-  // 3. Calculate streak and load user analytics
+  // 3. Calculate streak and load comprehensive analytics
   const loadUserAnalytics = useCallback(async (userId: string) => {
     const { data: sessions, error } = await supabase
       .from('study_sessions')
-      .select('duration_minutes, created_at')
+      .select('id, duration_minutes, subject, mode, created_at')
       .eq('user_id', userId)
       .order('created_at', { ascending: true })
 
@@ -179,14 +203,24 @@ export default function StoodyApp() {
 
     let totalMins = 0
     const dailyMap: Record<string, number> = {}
+    const todayStr = new Date().toISOString().split('T')[0]
+    const todayDistribution = new Array(24).fill(0)
 
     sessions.forEach((s) => {
       const mins = Number(s.duration_minutes) || 0
       totalMins += mins
-      const dayKey = s.created_at.split('T')[0]
+      const sessionDate = new Date(s.created_at)
+      const dayKey = sessionDate.toISOString().split('T')[0]
       dailyMap[dayKey] = (dailyMap[dayKey] || 0) + mins
+
+      // Today's hourly distribution
+      if (dayKey === todayStr) {
+        const hour = sessionDate.getHours()
+        todayDistribution[hour] = (todayDistribution[hour] || 0) + mins
+      }
     })
 
+    // Compute active consecutive day streak
     let streak = 0
     const checkDate = new Date()
     while (true) {
@@ -208,9 +242,9 @@ export default function StoodyApp() {
       }
     }
     const finalStreak = Math.max(streak, 1)
-
     await supabase.from('profiles').update({ current_streak: finalStreak }).eq('id', userId)
 
+    // 14-day Spline points
     const points: { label: string; hours: number; dateKey: string }[] = []
     for (let i = 13; i >= 0; i--) {
       const d = new Date()
@@ -221,13 +255,36 @@ export default function StoodyApp() {
       points.push({ label, hours, dateKey })
     }
 
+    // 7-day Bar Chart points
+    const bars: DayBar[] = []
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date()
+      d.setDate(d.getDate() - i)
+      const dateKey = d.toISOString().split('T')[0]
+      const dayLabel = i === 0 ? 'Today' : d.toLocaleDateString('en-US', { weekday: 'short' })
+      const minutes = dailyMap[dateKey] || 0
+      bars.push({
+        dayLabel,
+        dateKey,
+        minutes,
+        hours: Number((minutes / 60).toFixed(1)),
+        isToday: i === 0
+      })
+    }
+
+    // Get last 5 sessions sorted descending
+    const recent = [...sessions].reverse().slice(0, 5)
+
     setAnalyticsData({
       totalMinutes: totalMins,
       sessionCount: sessions.length,
       activeDaysCount: Object.keys(dailyMap).length,
       currentStreak: finalStreak,
       dailyBreakdown: dailyMap,
+      todayHoursDistribution: todayDistribution,
+      recentSessions: recent,
       splinePoints: points,
+      sevenDayBars: bars
     })
 
     loadLeaderboardData()
@@ -333,7 +390,7 @@ export default function StoodyApp() {
     }
   }, [user, subject, engineMode, loadUserAnalytics])
 
-  // 7. Advance Pomodoro Phase
+  // 7. Advance Pomodoro Phase on Normal Timer Expiration
   const handlePomodoroCompletion = useCallback(() => {
     playCompletionChime()
 
@@ -363,7 +420,33 @@ export default function StoodyApp() {
     targetEndRef.current = null
   }, [pomoPhase, pomoRound, autoLogSession, playCompletionChime])
 
-  // 8. Synchronize display inputs with timeLeft
+  // 8. Fixed Skip Handler: Advances state WITHOUT logging unearned minutes
+  const skipPomodoroPhase = () => {
+    setIsRunning(false)
+    targetEndRef.current = null
+
+    if (pomoPhase === 'work') {
+      if (pomoRound >= 4) {
+        setPomoPhase('longBreak')
+        setTimeLeft(15 * 60)
+        setPomoRound(1)
+        setSaveStatus('Skipped to Long Break.')
+      } else {
+        setPomoPhase('shortBreak')
+        setTimeLeft(5 * 60)
+        setSaveStatus(`Skipped to Break (${pomoRound}/4).`)
+      }
+    } else {
+      if (pomoPhase === 'shortBreak') {
+        setPomoRound((prev) => prev + 1)
+      }
+      setPomoPhase('work')
+      setTimeLeft(25 * 60)
+      setSaveStatus(`Skipped break. Staged Round ${pomoPhase === 'shortBreak' ? pomoRound + 1 : 1}.`)
+    }
+  }
+
+  // 9. Synchronize display inputs with timeLeft
   useEffect(() => {
     if (engineMode !== 'stopwatch') {
       const mins = Math.floor(timeLeft / 60)
@@ -373,7 +456,7 @@ export default function StoodyApp() {
     }
   }, [timeLeft, engineMode])
 
-  // 9. Manual Digit Editing (Allowed for Custom Timer)
+  // 10. Manual Digit Editing
   const handleMinuteInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (engineMode === 'pomodoro') return
     const val = e.target.value.replace(/\D/g, '').slice(0, 3)
@@ -396,7 +479,7 @@ export default function StoodyApp() {
     setCustomMinutes(Math.max(1, Math.round(newTotal / 60)))
   }
 
-  // 10. Switch Engine Modes
+  // 11. Switch Engine Modes
   const switchEngineMode = (newMode: EngineMode) => {
     setIsRunning(false)
     targetEndRef.current = null
@@ -414,13 +497,7 @@ export default function StoodyApp() {
     }
   }
 
-  const skipPomodoroPhase = () => {
-    setIsRunning(false)
-    targetEndRef.current = null
-    handlePomodoroCompletion()
-  }
-
-  // 11. Timestamp-Driven Ticking Loop
+  // 12. Timestamp-Driven Ticking Loop
   useEffect(() => {
     if (isRunning) {
       if (engineMode === 'stopwatch') {
@@ -515,7 +592,7 @@ export default function StoodyApp() {
     })
   }
 
-  // 12. Rolling Heat Map ending on Today
+  // 13. Rolling Heat Map ending on Today
   const heatMapDays = useMemo(() => {
     const days: HeatMapDay[] = []
     const totalWeeks = 20
@@ -548,7 +625,7 @@ export default function StoodyApp() {
     return days
   }, [analyticsData.dailyBreakdown])
 
-  // 13. Dynamic 14-Day Spline Curve
+  // 14. 14-Day Spline Curve
   const splinePath = useMemo(() => {
     const pts = analyticsData.splinePoints
     if (!pts.length) return ''
@@ -573,6 +650,18 @@ export default function StoodyApp() {
       return `${acc} C ${cp1x},${cp1y} ${cp2x},${cp2y} ${pt.x},${pt.y}`
     }, '')
   }, [analyticsData.splinePoints])
+
+  // Max value calculation for 7-day bar chart
+  const maxBarHours = useMemo(() => {
+    const max = Math.max(...analyticsData.sevenDayBars.map(b => b.hours), 1)
+    return Math.ceil(max)
+  }, [analyticsData.sevenDayBars])
+
+  // Today's total minutes calculation
+  const todayTotalMinutes = useMemo(() => {
+    const todayStr = new Date().toISOString().split('T')[0]
+    return analyticsData.dailyBreakdown[todayStr] || 0
+  }, [analyticsData.dailyBreakdown])
 
   if (authLoading) {
     return (
@@ -661,7 +750,6 @@ export default function StoodyApp() {
 
   return (
     <div className="min-h-screen bg-[#09090b] text-zinc-100 flex flex-col font-sans selection:bg-purple-600/30">
-      {/* Dynamic Keyframes for the Calming Breathing Rhythm during Breaks */}
       <style jsx global>{`
         @keyframes calmBreath {
           0%, 100% {
@@ -766,7 +854,7 @@ export default function StoodyApp() {
             {/* Timer Core */}
             <div className="rounded-3xl bg-zinc-900/40 border border-zinc-800 p-8 flex flex-col items-center justify-center relative overflow-hidden backdrop-blur-xl">
               
-              {/* Dynamic Ambient Glow: Violet in Focus, Calming Emerald Breathing in Break */}
+              {/* Dynamic Ambient Glow */}
               {isBreakActive ? (
                 <div className="absolute w-80 h-80 bg-emerald-500/30 rounded-full blur-3xl pointer-events-none animate-calm-breath transition-all duration-1000" />
               ) : (
@@ -791,7 +879,7 @@ export default function StoodyApp() {
                     engineMode === 'timer' ? 'bg-purple-600 text-white shadow-md' : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
-                  <Hourglass className="w-3.5 h-3.5" /> Custom Timer
+                  <Hourglass className="w-3.5 h-3.5" /> Timer
                 </button>
                 <button
                   onClick={() => switchEngineMode('stopwatch')}
@@ -900,7 +988,7 @@ export default function StoodyApp() {
                   <button
                     onClick={skipPomodoroPhase}
                     className="p-3.5 rounded-xl bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-zinc-300 transition"
-                    title="Skip to next phase"
+                    title="Skip to next phase without logging"
                   >
                     <SkipForward className="w-4 h-4" />
                   </button>
@@ -921,6 +1009,7 @@ export default function StoodyApp() {
         {/* VIEW 2: ANALYTICS */}
         {currentView === 'analytics' && (
           <div className="space-y-6 animate-in fade-in duration-200">
+            {/* Metric Overview Cards */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-2xl p-4">
                 <div className="text-zinc-500 text-xs flex items-center gap-1.5 mb-1"><Clock className="w-3.5 h-3.5" /> Total Time</div>
@@ -951,12 +1040,134 @@ export default function StoodyApp() {
               </div>
             </div>
 
-            {/* Study Activity Curve with Hover Tooltip */}
+            {/* NEW: Today at a Glance + 7-Day Bar Chart Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              
+              {/* Card 1: Today at a Glance */}
+              <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-6 flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="text-base font-semibold text-white flex items-center gap-2">
+                      <Sparkles className="w-4 h-4 text-purple-400" /> Today at a Glance
+                    </h3>
+                    <span className="text-xs font-mono text-purple-400 bg-purple-950/40 border border-purple-800/50 px-2.5 py-1 rounded-lg">
+                      {Math.floor(todayTotalMinutes / 60)}h {todayTotalMinutes % 60}m logged
+                    </span>
+                  </div>
+                  <p className="text-xs text-zinc-400">Hourly focus distribution over today&apos;s 24-hour cycle.</p>
+                </div>
+
+                {/* 24-Hour Timeline Matrix */}
+                <div className="py-6 space-y-3">
+                  <div className="flex items-center justify-between text-[11px] text-zinc-500 font-mono">
+                    <span className="flex items-center gap-1"><Moon className="w-3 h-3" /> 12 AM</span>
+                    <span className="flex items-center gap-1"><Sun className="w-3 h-3" /> 12 PM</span>
+                    <span className="flex items-center gap-1"><Moon className="w-3 h-3" /> 11 PM</span>
+                  </div>
+
+                  <div className="grid grid-cols-24 gap-1 h-12 items-end bg-zinc-950/50 p-1.5 rounded-xl border border-zinc-800/60">
+                    {analyticsData.todayHoursDistribution.map((mins, hr) => {
+                      const heightPercent = mins > 0 ? Math.min(100, Math.max(25, (mins / 60) * 100)) : 8
+                      return (
+                        <div
+                          key={hr}
+                          className="h-full flex flex-col justify-end group relative cursor-pointer"
+                        >
+                          <div
+                            style={{ height: `${heightPercent}%` }}
+                            className={`w-full rounded-sm transition-all duration-300 ${
+                              mins > 0
+                                ? 'bg-purple-500 group-hover:bg-purple-400 group-hover:scale-110 shadow-sm shadow-purple-500/50'
+                                : 'bg-zinc-800/60 group-hover:bg-zinc-700'
+                            }`}
+                          />
+                          {/* Mini Hover Tooltip */}
+                          <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 hidden group-hover:flex flex-col items-center pointer-events-none z-30">
+                            <div className="bg-zinc-900 border border-zinc-700 text-white text-[10px] py-1 px-2 rounded-md shadow-xl whitespace-nowrap font-mono">
+                              {hr % 12 === 0 ? 12 : hr % 12} {hr >= 12 ? 'PM' : 'AM'}: {mins}m
+                            </div>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between text-[11px] text-zinc-500 pt-2 border-t border-zinc-800/40">
+                  <span>Tracked from real-time session logs</span>
+                  <span className="text-zinc-400 font-medium">Reset at midnight</span>
+                </div>
+              </div>
+
+              {/* Card 2: Interactive 7-Day Bar Chart */}
+              <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-6 relative flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="text-base font-semibold text-white flex items-center gap-2">
+                      <BarChart3 className="w-4 h-4 text-purple-400" /> Past 7 Days
+                    </h3>
+                    <span className="text-xs text-zinc-400 font-mono">Peak: {maxBarHours}h</span>
+                  </div>
+                  <p className="text-xs text-zinc-400">Hover over any day bar for exact hours and session minutes.</p>
+                </div>
+
+                {/* Bars Container */}
+                <div className="py-4 relative">
+                  {hoveredBar && (
+                    <div className="absolute top-0 right-4 bg-zinc-900/90 border border-purple-500/40 px-3 py-1 rounded-lg text-xs font-mono text-purple-300 shadow-xl backdrop-blur-md animate-in fade-in">
+                      {hoveredBar.dayLabel}: <span className="font-bold text-white">{hoveredBar.hours} hrs</span> ({hoveredBar.minutes} mins)
+                    </div>
+                  )}
+
+                  <div className="h-36 flex items-end justify-between gap-3 pt-6 px-2">
+                    {analyticsData.sevenDayBars.map((bar, i) => {
+                      const barFillPercent = Math.min(100, Math.max(6, (bar.hours / maxBarHours) * 100))
+                      return (
+                        <div
+                          key={i}
+                          onMouseEnter={() => setHoveredBar(bar)}
+                          onMouseLeave={() => setHoveredBar(null)}
+                          className="flex-1 flex flex-col items-center gap-2 h-full justify-end cursor-pointer group"
+                        >
+                          <div className="w-full relative flex items-end justify-center h-full">
+                            <div
+                              style={{ height: `${barFillPercent}%` }}
+                              className={`w-full max-w-[36px] rounded-t-xl transition-all duration-500 ease-out group-hover:scale-y-105 group-hover:brightness-125 ${
+                                bar.isToday
+                                  ? 'bg-gradient-to-t from-purple-700 to-purple-400 ring-2 ring-purple-400/40 shadow-lg shadow-purple-600/30'
+                                  : bar.minutes > 0
+                                  ? 'bg-gradient-to-t from-purple-900/80 to-purple-600'
+                                  : 'bg-zinc-800/60'
+                              }`}
+                            />
+                          </div>
+                          <span className={`text-[11px] font-mono transition ${
+                            bar.isToday ? 'text-purple-300 font-bold' : 'text-zinc-500 group-hover:text-zinc-300'
+                          }`}>
+                            {bar.dayLabel}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between text-[11px] text-zinc-500 pt-2 border-t border-zinc-800/40">
+                  <span>Interactive day analytics</span>
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-purple-500" />
+                    <span>Focus Hours</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Study Activity Curve */}
             <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-6 relative">
               <div className="flex items-center justify-between mb-4">
                 <div>
                   <h3 className="text-base font-semibold text-white">Study Activity</h3>
-                  <p className="text-xs text-zinc-400 mt-0.5">Daily focus time over the last 14 days (hover nodes for stats)</p>
+                  <p className="text-xs text-zinc-400 mt-0.5">Daily focus trend over the last 14 days</p>
                 </div>
                 <div className="flex gap-1 bg-zinc-900 p-1 rounded-xl border border-zinc-800 text-[11px]">
                   <span className="px-2.5 py-1 rounded-lg bg-zinc-800 text-white font-medium">14D</span>
@@ -1092,6 +1303,39 @@ export default function StoodyApp() {
                 </div>
               </div>
             </div>
+
+            {/* NEW: Recent Sessions Activity Feed */}
+            <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-6">
+              <h3 className="text-base font-semibold text-white mb-4">Recent Sessions</h3>
+              <div className="divide-y divide-zinc-800/60">
+                {analyticsData.recentSessions.length > 0 ? (
+                  analyticsData.recentSessions.map((session) => (
+                    <div key={session.id} className="py-3 flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400">
+                          <Clock className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <div className="text-sm font-medium text-white">{session.subject || 'General'}</div>
+                          <div className="text-[11px] text-zinc-500 capitalize">{session.mode || 'Focus block'}</div>
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-sm font-semibold text-purple-400">+{session.duration_minutes}m</div>
+                        <div className="text-[11px] text-zinc-500 font-mono">
+                          {new Date(session.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="py-6 text-center text-xs text-zinc-500">
+                    No sessions logged yet today. Complete a focus block to see it appear here!
+                  </div>
+                )}
+              </div>
+            </div>
+
           </div>
         )}
 
