@@ -10,6 +10,7 @@ import {
   Play, 
   Pause, 
   RotateCcw, 
+  SkipForward,
   LayoutDashboard, 
   BarChart3, 
   Trophy, 
@@ -22,7 +23,8 @@ import {
   TrendingUp
 } from 'lucide-react'
 
-type Mode = 'pomodoro' | 'timer' | 'break' | 'stopwatch'
+type EngineMode = 'pomodoro' | 'timer' | 'stopwatch'
+type PomodoroPhase = 'work' | 'shortBreak' | 'longBreak'
 type View = 'dashboard' | 'analytics' | 'leaderboard'
 
 interface HeatMapDay {
@@ -57,8 +59,12 @@ export default function StoodyApp() {
   const [authLoading, setAuthLoading] = useState<boolean>(true)
   const [currentView, setCurrentView] = useState<View>('dashboard')
   
-  // Timer & Editable State
-  const [mode, setMode] = useState<Mode>('pomodoro')
+  // Timer Engines & States
+  const [engineMode, setEngineMode] = useState<EngineMode>('pomodoro')
+  const [pomoPhase, setPomoPhase] = useState<PomodoroPhase>('work')
+  const [pomoRound, setPomoRound] = useState<number>(1)
+  
+  // Custom Timer inputs
   const [customMinutes, setCustomMinutes] = useState<number>(25)
   const [inputMins, setInputMins] = useState<string>('25')
   const [inputSecs, setInputSecs] = useState<string>('00')
@@ -85,7 +91,7 @@ export default function StoodyApp() {
   const [onlineUsers, setOnlineUsers] = useState<Record<string, PresenceUser>>({})
   const [leaderboardUsers, setLeaderboardUsers] = useState<LeaderboardUser[]>([])
 
-  // Tab-Throttling Proof Timestamps
+  // Timestamp references
   const targetEndRef = useRef<number | null>(null)
   const stopwatchStartRef = useRef<number | null>(null)
   const timerRef = useRef<NodeJS.Timeout | null>(null)
@@ -108,15 +114,17 @@ export default function StoodyApp() {
     splinePoints: [],
   })
 
-  // 1. Audio chime on timer completion
+  const isBreakActive = engineMode === 'pomodoro' && pomoPhase !== 'work'
+
+  // 1. Audio chime on completion
   const playCompletionChime = useCallback(() => {
     try {
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
       const osc = audioCtx.createOscillator()
       const gain = audioCtx.createGain()
       osc.type = 'sine'
-      osc.frequency.setValueAtTime(587.33, audioCtx.currentTime) // D5
-      osc.frequency.exponentialRampToValueAtTime(880, audioCtx.currentTime + 0.3) // A5
+      osc.frequency.setValueAtTime(587.33, audioCtx.currentTime)
+      osc.frequency.exponentialRampToValueAtTime(880, audioCtx.currentTime + 0.3)
       gain.gain.setValueAtTime(0.3, audioCtx.currentTime)
       gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.8)
       osc.connect(gain)
@@ -124,7 +132,7 @@ export default function StoodyApp() {
       osc.start()
       osc.stop(audioCtx.currentTime + 0.8)
     } catch {
-      // AudioContext policy suppression fallback
+      // AudioContext fallback
     }
   }, [])
 
@@ -179,7 +187,6 @@ export default function StoodyApp() {
       dailyMap[dayKey] = (dailyMap[dayKey] || 0) + mins
     })
 
-    // Compute active consecutive day streak
     let streak = 0
     const checkDate = new Date()
     while (true) {
@@ -291,7 +298,7 @@ export default function StoodyApp() {
           await channel.track({
             userId: user.id,
             name: user.user_metadata?.full_name || user.email?.split('@')[0] || 'Student',
-            isStudying: isRunning,
+            isStudying: isRunning && (engineMode !== 'pomodoro' || pomoPhase === 'work'),
             subject: subject,
             startedAt: isRunning ? Date.now() : undefined
           })
@@ -303,7 +310,7 @@ export default function StoodyApp() {
     return () => {
       channel.unsubscribe()
     }
-  }, [user, isRunning, subject])
+  }, [user, isRunning, subject, engineMode, pomoPhase])
 
   // 6. Automated Session Logger
   const autoLogSession = useCallback(async (durationMinutes: number) => {
@@ -314,7 +321,7 @@ export default function StoodyApp() {
       user_id: user.id,
       duration_minutes: durationMinutes,
       subject: subject || 'General',
-      mode: mode,
+      mode: engineMode,
     })
 
     if (!error) {
@@ -324,20 +331,51 @@ export default function StoodyApp() {
     } else {
       setSaveStatus('Failed to sync session')
     }
-  }, [user, subject, mode, loadUserAnalytics])
+  }, [user, subject, engineMode, loadUserAnalytics])
 
-  // 7. Synchronize inputs with timer seconds
+  // 7. Advance Pomodoro Phase
+  const handlePomodoroCompletion = useCallback(() => {
+    playCompletionChime()
+
+    if (pomoPhase === 'work') {
+      autoLogSession(25)
+
+      if (pomoRound >= 4) {
+        setPomoPhase('longBreak')
+        setTimeLeft(15 * 60)
+        setPomoRound(1)
+        setSaveStatus('Completed 4 rounds! 15m Long Break.')
+      } else {
+        setPomoPhase('shortBreak')
+        setTimeLeft(5 * 60)
+        setSaveStatus(`Round ${pomoRound} complete! 5m Short Break.`)
+      }
+    } else {
+      if (pomoPhase === 'shortBreak') {
+        setPomoRound((prev) => prev + 1)
+      }
+      setPomoPhase('work')
+      setTimeLeft(25 * 60)
+      setSaveStatus(`Break over! Ready for Round ${pomoPhase === 'shortBreak' ? pomoRound + 1 : 1}.`)
+    }
+
+    setIsRunning(false)
+    targetEndRef.current = null
+  }, [pomoPhase, pomoRound, autoLogSession, playCompletionChime])
+
+  // 8. Synchronize display inputs with timeLeft
   useEffect(() => {
-    if (mode !== 'stopwatch') {
+    if (engineMode !== 'stopwatch') {
       const mins = Math.floor(timeLeft / 60)
       const secs = timeLeft % 60
       setInputMins(String(mins).padStart(2, '0'))
       setInputSecs(String(secs).padStart(2, '0'))
     }
-  }, [timeLeft, mode])
+  }, [timeLeft, engineMode])
 
-  // 8. Direct digit edit handlers
+  // 9. Manual Digit Editing (Allowed for Custom Timer)
   const handleMinuteInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (engineMode === 'pomodoro') return
     const val = e.target.value.replace(/\D/g, '').slice(0, 3)
     setInputMins(val)
     const numericMinutes = parseInt(val || '0', 10)
@@ -348,6 +386,7 @@ export default function StoodyApp() {
   }
 
   const handleSecondInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (engineMode === 'pomodoro') return
     const val = e.target.value.replace(/\D/g, '').slice(0, 2)
     const clamped = Math.min(59, parseInt(val || '0', 10))
     setInputSecs(String(clamped).padStart(2, '0'))
@@ -357,18 +396,17 @@ export default function StoodyApp() {
     setCustomMinutes(Math.max(1, Math.round(newTotal / 60)))
   }
 
-  // 9. Mode switch logic
-  const switchMode = (newMode: Mode) => {
+  // 10. Switch Engine Modes
+  const switchEngineMode = (newMode: EngineMode) => {
     setIsRunning(false)
     targetEndRef.current = null
     stopwatchStartRef.current = null
-    setMode(newMode)
+    setEngineMode(newMode)
+
     if (newMode === 'pomodoro') {
-      setCustomMinutes(25)
+      setPomoPhase('work')
+      setPomoRound(1)
       setTimeLeft(25 * 60)
-    } else if (newMode === 'break') {
-      setCustomMinutes(5)
-      setTimeLeft(5 * 60)
     } else if (newMode === 'timer') {
       setTimeLeft(customMinutes * 60)
     } else if (newMode === 'stopwatch') {
@@ -376,17 +414,23 @@ export default function StoodyApp() {
     }
   }
 
-  // 10. Accurate Timestamp-Driven Ticking Loop
+  const skipPomodoroPhase = () => {
+    setIsRunning(false)
+    targetEndRef.current = null
+    handlePomodoroCompletion()
+  }
+
+  // 11. Timestamp-Driven Ticking Loop
   useEffect(() => {
     if (isRunning) {
-      if (mode === 'stopwatch') {
+      if (engineMode === 'stopwatch') {
         stopwatchStartRef.current = Date.now() - stopwatchElapsed * 1000
       } else {
         targetEndRef.current = Date.now() + timeLeft * 1000
       }
 
       timerRef.current = setInterval(() => {
-        if (mode === 'stopwatch') {
+        if (engineMode === 'stopwatch') {
           if (stopwatchStartRef.current) {
             const elapsed = Math.floor((Date.now() - stopwatchStartRef.current) / 1000)
             setStopwatchElapsed(elapsed)
@@ -398,10 +442,14 @@ export default function StoodyApp() {
 
             if (remaining <= 0) {
               clearInterval(timerRef.current!)
-              setIsRunning(false)
-              targetEndRef.current = null
-              playCompletionChime()
-              autoLogSession(customMinutes)
+              if (engineMode === 'pomodoro') {
+                handlePomodoroCompletion()
+              } else {
+                setIsRunning(false)
+                targetEndRef.current = null
+                playCompletionChime()
+                autoLogSession(customMinutes)
+              }
             }
           }
         }
@@ -415,17 +463,20 @@ export default function StoodyApp() {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current)
     }
-  }, [isRunning, mode, customMinutes, autoLogSession, playCompletionChime])
+  }, [isRunning, engineMode, customMinutes, timeLeft, stopwatchElapsed, autoLogSession, handlePomodoroCompletion, playCompletionChime])
 
   const toggleTimer = () => {
     if (isRunning) {
-      if (mode === 'stopwatch') {
+      if (engineMode === 'stopwatch') {
         const mins = Math.round(stopwatchElapsed / 60)
         if (mins >= 1) autoLogSession(mins)
-      } else {
+      } else if (engineMode === 'timer') {
         const plannedSeconds = customMinutes * 60
         const elapsedSeconds = plannedSeconds - timeLeft
         const elapsedMinutes = Math.floor(elapsedSeconds / 60)
+        if (elapsedMinutes >= 1) autoLogSession(elapsedMinutes)
+      } else if (engineMode === 'pomodoro' && pomoPhase === 'work') {
+        const elapsedMinutes = Math.floor((25 * 60 - timeLeft) / 60)
         if (elapsedMinutes >= 1) autoLogSession(elapsedMinutes)
       }
       setIsRunning(false)
@@ -438,8 +489,12 @@ export default function StoodyApp() {
     setIsRunning(false)
     targetEndRef.current = null
     stopwatchStartRef.current = null
-    if (mode === 'stopwatch') {
+    if (engineMode === 'stopwatch') {
       setStopwatchElapsed(0)
+    } else if (engineMode === 'pomodoro') {
+      if (pomoPhase === 'work') setTimeLeft(25 * 60)
+      else if (pomoPhase === 'shortBreak') setTimeLeft(5 * 60)
+      else setTimeLeft(15 * 60)
     } else {
       setTimeLeft(customMinutes * 60)
     }
@@ -460,7 +515,7 @@ export default function StoodyApp() {
     })
   }
 
-  // 11. Rolling Heat Map ending on Today
+  // 12. Rolling Heat Map ending on Today
   const heatMapDays = useMemo(() => {
     const days: HeatMapDay[] = []
     const totalWeeks = 20
@@ -493,7 +548,7 @@ export default function StoodyApp() {
     return days
   }, [analyticsData.dailyBreakdown])
 
-  // 12. Dynamic 14-Day Spline Curve
+  // 13. Dynamic 14-Day Spline Curve
   const splinePath = useMemo(() => {
     const pts = analyticsData.splinePoints
     if (!pts.length) return ''
@@ -519,7 +574,6 @@ export default function StoodyApp() {
     }, '')
   }, [analyticsData.splinePoints])
 
-  // Loading Screen
   if (authLoading) {
     return (
       <div className="min-h-screen bg-[#09090b] flex flex-col items-center justify-center text-zinc-400">
@@ -529,7 +583,7 @@ export default function StoodyApp() {
     )
   }
 
-  // DIRECTION 3: MINIMALIST AESTHETIC LANDING CARD
+  // DIRECTION 3: MINIMALIST LANDING CARD
   if (!user) {
     return (
       <div className="min-h-screen bg-[#09090b] text-zinc-100 flex flex-col items-center justify-center p-6 selection:bg-purple-600/30 relative overflow-hidden">
@@ -555,8 +609,8 @@ export default function StoodyApp() {
                 <Flame className="w-4 h-4 fill-orange-500/20" />
               </div>
               <div className="text-left">
-                <div className="text-xs font-semibold text-zinc-200">Streaks & Auto-Persistence</div>
-                <div className="text-[11px] text-zinc-500">Sessions automatically sync to your cloud streak</div>
+                <div className="text-xs font-semibold text-zinc-200">Pomodoro Intervals & Streaks</div>
+                <div className="text-[11px] text-zinc-500">Focus cycles automatically sync to your cloud streak</div>
               </div>
             </div>
 
@@ -605,9 +659,25 @@ export default function StoodyApp() {
     )
   }
 
-  // APP DASHBOARD
   return (
     <div className="min-h-screen bg-[#09090b] text-zinc-100 flex flex-col font-sans selection:bg-purple-600/30">
+      {/* Dynamic Keyframes for the Calming Breathing Rhythm during Breaks */}
+      <style jsx global>{`
+        @keyframes calmBreath {
+          0%, 100% {
+            transform: scale(0.9);
+            opacity: 0.18;
+          }
+          50% {
+            transform: scale(1.22);
+            opacity: 0.45;
+          }
+        }
+        .animate-calm-breath {
+          animation: calmBreath 4.2s ease-in-out infinite;
+        }
+      `}</style>
+
       {/* Top Navbar */}
       <header className="border-b border-zinc-800/80 px-6 py-4 flex items-center justify-between backdrop-blur-md sticky top-0 z-50">
         <div className="flex items-center gap-3">
@@ -695,66 +765,105 @@ export default function StoodyApp() {
 
             {/* Timer Core */}
             <div className="rounded-3xl bg-zinc-900/40 border border-zinc-800 p-8 flex flex-col items-center justify-center relative overflow-hidden backdrop-blur-xl">
-              <div className="absolute w-72 h-72 bg-purple-600/10 rounded-full blur-3xl pointer-events-none" />
+              
+              {/* Dynamic Ambient Glow: Violet in Focus, Calming Emerald Breathing in Break */}
+              {isBreakActive ? (
+                <div className="absolute w-80 h-80 bg-emerald-500/30 rounded-full blur-3xl pointer-events-none animate-calm-breath transition-all duration-1000" />
+              ) : (
+                <div className="absolute w-72 h-72 bg-purple-600/10 rounded-full blur-3xl pointer-events-none transition-all duration-700" />
+              )}
 
-              {/* Mode Switchers */}
-              <div className="flex flex-wrap items-center justify-center gap-2 p-1.5 bg-zinc-900/80 rounded-2xl border border-zinc-800/90 mb-8 z-10">
+              {/* Engine Switcher */}
+              <div className="flex flex-wrap items-center justify-center gap-2 p-1.5 bg-zinc-900/80 rounded-2xl border border-zinc-800/90 mb-6 z-10">
                 <button
-                  onClick={() => switchMode('pomodoro')}
+                  onClick={() => switchEngineMode('pomodoro')}
                   className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold transition ${
-                    mode === 'pomodoro' ? 'bg-purple-600 text-white shadow-md' : 'text-zinc-400 hover:text-zinc-200'
+                    engineMode === 'pomodoro' 
+                      ? isBreakActive ? 'bg-emerald-600 text-white shadow-md' : 'bg-purple-600 text-white shadow-md'
+                      : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
-                  <Flame className="w-3.5 h-3.5" /> Pomodoro
+                  <Flame className="w-3.5 h-3.5" /> Pomodoro Cycle
                 </button>
                 <button
-                  onClick={() => switchMode('timer')}
+                  onClick={() => switchEngineMode('timer')}
                   className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold transition ${
-                    mode === 'timer' ? 'bg-purple-600 text-white shadow-md' : 'text-zinc-400 hover:text-zinc-200'
+                    engineMode === 'timer' ? 'bg-purple-600 text-white shadow-md' : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
                   <Hourglass className="w-3.5 h-3.5" /> Custom Timer
                 </button>
                 <button
-                  onClick={() => switchMode('break')}
+                  onClick={() => switchEngineMode('stopwatch')}
                   className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold transition ${
-                    mode === 'break' ? 'bg-purple-600 text-white shadow-md' : 'text-zinc-400 hover:text-zinc-200'
-                  }`}
-                >
-                  <Coffee className="w-3.5 h-3.5" /> Break
-                </button>
-                <button
-                  onClick={() => switchMode('stopwatch')}
-                  className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold transition ${
-                    mode === 'stopwatch' ? 'bg-purple-600 text-white shadow-md' : 'text-zinc-400 hover:text-zinc-200'
+                    engineMode === 'stopwatch' ? 'bg-purple-600 text-white shadow-md' : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
                   <Watch className="w-3.5 h-3.5" /> Stopwatch
                 </button>
               </div>
 
-              {/* Directly Editable Big Timer Numbers */}
-              <div className="text-7xl md:text-8xl font-black tracking-tight text-white mb-6 tabular-nums select-none z-10 font-mono">
-                {mode === 'stopwatch' ? (
+              {/* Pomodoro Round Indicator & Phase Pill */}
+              {engineMode === 'pomodoro' && (
+                <div className="flex items-center gap-3 mb-6 z-10">
+                  <div className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border transition-all ${
+                    isBreakActive 
+                      ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-400' 
+                      : 'bg-zinc-900/90 border-zinc-800 text-zinc-300'
+                  }`}>
+                    {pomoPhase === 'work' && <span className="text-purple-400 font-semibold">Focus Block</span>}
+                    {pomoPhase === 'shortBreak' && <span className="text-emerald-400 font-semibold flex items-center gap-1.5"><Coffee className="w-3 h-3" /> Short Break</span>}
+                    {pomoPhase === 'longBreak' && <span className="text-emerald-400 font-semibold flex items-center gap-1.5"><Coffee className="w-3 h-3" /> Long Break</span>}
+                  </div>
+
+                  {/* 4 Round Dots */}
+                  <div className="flex items-center gap-1.5 bg-zinc-900/90 border border-zinc-800 px-3 py-1.5 rounded-full">
+                    {[1, 2, 3, 4].map((dot) => (
+                      <div
+                        key={dot}
+                        className={`w-2 h-2 rounded-full transition-all ${
+                          dot < pomoRound || (dot === pomoRound && pomoPhase !== 'work')
+                            ? isBreakActive ? 'bg-emerald-500 ring-2 ring-emerald-500/30' : 'bg-purple-500 ring-2 ring-purple-500/30'
+                            : dot === pomoRound
+                            ? isBreakActive ? 'bg-emerald-400 animate-pulse' : 'bg-purple-400 animate-pulse'
+                            : 'bg-zinc-700'
+                        }`}
+                        title={`Round ${dot} of 4`}
+                      />
+                    ))}
+                    <span className="text-[10px] text-zinc-400 font-mono ml-1">R{pomoRound}/4</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Big Timer Digits */}
+              <div className={`text-7xl md:text-8xl font-black tracking-tight mb-6 tabular-nums select-none z-10 font-mono transition-colors duration-500 ${
+                isBreakActive ? 'text-emerald-100' : 'text-white'
+              }`}>
+                {engineMode === 'stopwatch' ? (
                   <span>{formatTime(stopwatchElapsed)}</span>
                 ) : (
                   <div className="flex items-center justify-center">
                     <input
                       type="text"
-                      disabled={isRunning}
+                      disabled={isRunning || engineMode === 'pomodoro'}
                       value={inputMins}
                       onChange={handleMinuteInput}
-                      title={isRunning ? 'Pause timer to edit duration' : 'Click to type minutes'}
-                      className="w-28 md:w-36 text-right bg-transparent border-b-2 border-transparent hover:border-zinc-700 focus:border-purple-500 focus:outline-none transition selection:bg-purple-600/40 cursor-pointer disabled:cursor-default"
+                      title={engineMode === 'pomodoro' ? 'Pomodoro sets duration automatically' : isRunning ? 'Pause to edit' : 'Type minutes'}
+                      className={`w-28 md:w-36 text-right bg-transparent border-b-2 border-transparent transition selection:bg-purple-600/40 ${
+                        engineMode === 'pomodoro' ? 'cursor-default' : 'hover:border-zinc-700 focus:border-purple-500 focus:outline-none cursor-pointer'
+                      }`}
                     />
-                    <span className="mx-1 text-zinc-500">:</span>
+                    <span className={`mx-1 ${isBreakActive ? 'text-emerald-500/60' : 'text-zinc-500'}`}>:</span>
                     <input
                       type="text"
-                      disabled={isRunning}
+                      disabled={isRunning || engineMode === 'pomodoro'}
                       value={inputSecs}
                       onChange={handleSecondInput}
-                      title={isRunning ? 'Pause timer to edit duration' : 'Click to type seconds'}
-                      className="w-28 md:w-36 text-left bg-transparent border-b-2 border-transparent hover:border-zinc-700 focus:border-purple-500 focus:outline-none transition selection:bg-purple-600/40 cursor-pointer disabled:cursor-default"
+                      title={engineMode === 'pomodoro' ? 'Pomodoro sets duration automatically' : isRunning ? 'Pause to edit' : 'Type seconds'}
+                      className={`w-28 md:w-36 text-left bg-transparent border-b-2 border-transparent transition selection:bg-purple-600/40 ${
+                        engineMode === 'pomodoro' ? 'cursor-default' : 'hover:border-zinc-700 focus:border-purple-500 focus:outline-none cursor-pointer'
+                      }`}
                     />
                   </div>
                 )}
@@ -777,11 +886,26 @@ export default function StoodyApp() {
               <div className="flex items-center gap-3 z-10">
                 <button
                   onClick={toggleTimer}
-                  className="flex items-center gap-2 px-8 py-3.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-semibold text-sm transition shadow-lg shadow-purple-600/25 active:scale-95"
+                  className={`flex items-center gap-2 px-8 py-3.5 rounded-xl font-semibold text-sm transition active:scale-95 ${
+                    isBreakActive
+                      ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/25'
+                      : 'bg-purple-600 hover:bg-purple-500 text-white shadow-lg shadow-purple-600/25'
+                  }`}
                 >
                   {isRunning ? <Pause className="w-4 h-4 fill-white" /> : <Play className="w-4 h-4 fill-white" />}
-                  {isRunning ? 'Pause & Auto-Save' : 'Start Focus'}
+                  {isRunning ? 'Pause & Auto-Save' : isBreakActive ? 'Start Break' : 'Start Focus'}
                 </button>
+
+                {engineMode === 'pomodoro' && (
+                  <button
+                    onClick={skipPomodoroPhase}
+                    className="p-3.5 rounded-xl bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-zinc-300 transition"
+                    title="Skip to next phase"
+                  >
+                    <SkipForward className="w-4 h-4" />
+                  </button>
+                )}
+
                 <button
                   onClick={resetTimer}
                   className="p-3.5 rounded-xl bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-zinc-300 transition"
@@ -1007,7 +1131,7 @@ export default function StoodyApp() {
                   const presence = onlineUsers[lbUser.id]
                   const isCurrent = user?.id === lbUser.id
                   const isOnline = Boolean(presence)
-                  const studyingNow = presence?.isStudying ?? (isCurrent && isRunning)
+                  const studyingNow = presence?.isStudying ?? (isCurrent && isRunning && (engineMode !== 'pomodoro' || pomoPhase === 'work'))
                   const activeSubj = presence?.subject || (isCurrent ? subject : 'General')
 
                   return (
