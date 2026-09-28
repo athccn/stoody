@@ -663,6 +663,17 @@ export default function StoodyApp() {
     return analyticsData.dailyBreakdown[todayStr] || 0
   }, [analyticsData.dailyBreakdown])
 
+  // Dynamic document title synced with active timer
+  useEffect(() => {
+    if (isRunning) {
+      const formatted = formatTime(engineMode === 'stopwatch' ? stopwatchElapsed : timeLeft)
+      const icon = isBreakActive ? '☕ ' : ''
+      document.title = `(${formatted}) ${icon}Stoody`
+    } else {
+      document.title = 'Stoody'
+    }
+  }, [isRunning, timeLeft, stopwatchElapsed, engineMode, isBreakActive])
+
   if (authLoading) {
     return (
       <div className="min-h-screen bg-[#09090b] flex flex-col items-center justify-center text-zinc-400">
