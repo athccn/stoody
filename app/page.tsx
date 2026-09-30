@@ -115,6 +115,10 @@ export default function StoodyApp() {
   const timerRef = useRef<NodeJS.Timeout | null>(null)
   const presenceChannelRef = useRef<any>(null)
 
+  // Anti-glitch Session & Mutex Refs
+  const activeRunStartRef = useRef<number | null>(null)
+  const isSavingRef = useRef<boolean>(false)
+
   // Analytics State
   const [analyticsData, setAnalyticsData] = useState<{
     totalMinutes: number
@@ -122,7 +126,7 @@ export default function StoodyApp() {
     activeDaysCount: number
     currentStreak: number
     dailyBreakdown: Record<string, number>
-    todayHoursDistribution: number[] // 24 hours of today
+    todayHoursDistribution: number[]
     recentSessions: SessionLog[]
     splinePoints: { label: string; hours: number; dateKey: string }[]
     sevenDayBars: DayBar[]
@@ -139,6 +143,23 @@ export default function StoodyApp() {
   })
 
   const isBreakActive = engineMode === 'pomodoro' && pomoPhase !== 'work'
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60)
+    const secs = seconds % 60
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+  }
+
+  // Dynamic Browser Tab Title
+  useEffect(() => {
+    if (isRunning) {
+      const formatted = formatTime(engineMode === 'stopwatch' ? stopwatchElapsed : timeLeft)
+      const icon = isBreakActive ? '☕ ' : ''
+      document.title = `(${formatted}) ${icon}Stoody`
+    } else {
+      document.title = 'Stoody'
+    }
+  }, [isRunning, timeLeft, stopwatchElapsed, engineMode, isBreakActive])
 
   // 1. Audio chime on completion
   const playCompletionChime = useCallback(() => {
@@ -191,7 +212,7 @@ export default function StoodyApp() {
     setLeaderboardUsers(formatted)
   }, [])
 
-  // 3. Calculate streak and load comprehensive analytics
+  // 3. Calculate streak and load user analytics
   const loadUserAnalytics = useCallback(async (userId: string) => {
     const { data: sessions, error } = await supabase
       .from('study_sessions')
@@ -213,14 +234,12 @@ export default function StoodyApp() {
       const dayKey = sessionDate.toISOString().split('T')[0]
       dailyMap[dayKey] = (dailyMap[dayKey] || 0) + mins
 
-      // Today's hourly distribution
       if (dayKey === todayStr) {
         const hour = sessionDate.getHours()
         todayDistribution[hour] = (todayDistribution[hour] || 0) + mins
       }
     })
 
-    // Compute active consecutive day streak
     let streak = 0
     const checkDate = new Date()
     while (true) {
@@ -244,7 +263,6 @@ export default function StoodyApp() {
     const finalStreak = Math.max(streak, 1)
     await supabase.from('profiles').update({ current_streak: finalStreak }).eq('id', userId)
 
-    // 14-day Spline points
     const points: { label: string; hours: number; dateKey: string }[] = []
     for (let i = 13; i >= 0; i--) {
       const d = new Date()
@@ -255,7 +273,6 @@ export default function StoodyApp() {
       points.push({ label, hours, dateKey })
     }
 
-    // 7-day Bar Chart points
     const bars: DayBar[] = []
     for (let i = 6; i >= 0; i--) {
       const d = new Date()
@@ -272,7 +289,6 @@ export default function StoodyApp() {
       })
     }
 
-    // Get last 5 sessions sorted descending
     const recent = [...sessions].reverse().slice(0, 5)
 
     setAnalyticsData({
@@ -369,30 +385,51 @@ export default function StoodyApp() {
     }
   }, [user, isRunning, subject, engineMode, pomoPhase])
 
-  // 6. Automated Session Logger
+  // 6. Mutex-Guarded Automated Session Logger
   const autoLogSession = useCallback(async (durationMinutes: number) => {
-    if (durationMinutes <= 0 || !user?.id) return
+    if (durationMinutes <= 0 || !user?.id || isSavingRef.current) return
 
+    isSavingRef.current = true
     setSaveStatus('Saving session...')
-    const { error } = await supabase.from('study_sessions').insert({
-      user_id: user.id,
-      duration_minutes: durationMinutes,
-      subject: subject || 'General',
-      mode: engineMode,
-    })
+    
+    try {
+      const { error } = await supabase.from('study_sessions').insert({
+        user_id: user.id,
+        duration_minutes: durationMinutes,
+        subject: subject || 'General',
+        mode: engineMode,
+      })
 
-    if (!error) {
-      setSaveStatus(`Logged ${durationMinutes}m automatically!`)
-      loadUserAnalytics(user.id)
-      setTimeout(() => setSaveStatus(''), 4000)
-    } else {
-      setSaveStatus('Failed to sync session')
+      if (!error) {
+        setSaveStatus(`Logged ${durationMinutes}m automatically!`)
+        await loadUserAnalytics(user.id)
+        setTimeout(() => setSaveStatus(''), 4000)
+      } else {
+        setSaveStatus('Failed to sync session')
+      }
+    } finally {
+      setTimeout(() => {
+        isSavingRef.current = false
+      }, 400)
     }
   }, [user, subject, engineMode, loadUserAnalytics])
 
-  // 7. Advance Pomodoro Phase on Normal Timer Expiration
+  // 7. Flush Active Study Session Delta (Prevents Double Count Glitch)
+  const flushCurrentSessionDelta = useCallback(() => {
+    if (!activeRunStartRef.current) return
+    const elapsedMs = Date.now() - activeRunStartRef.current
+    activeRunStartRef.current = null // Nullify immediately to reject second click
+
+    const elapsedMinutes = Math.floor(elapsedMs / 60000)
+    if (elapsedMinutes >= 1) {
+      autoLogSession(elapsedMinutes)
+    }
+  }, [autoLogSession])
+
+  // 8. Advance Pomodoro Phase on Normal Timer Expiration
   const handlePomodoroCompletion = useCallback(() => {
     playCompletionChime()
+    activeRunStartRef.current = null
 
     if (pomoPhase === 'work') {
       autoLogSession(25)
@@ -420,8 +457,9 @@ export default function StoodyApp() {
     targetEndRef.current = null
   }, [pomoPhase, pomoRound, autoLogSession, playCompletionChime])
 
-  // 8. Fixed Skip Handler: Advances state WITHOUT logging unearned minutes
+  // 9. Skip Handler: Advances state WITHOUT logging unearned minutes
   const skipPomodoroPhase = () => {
+    activeRunStartRef.current = null
     setIsRunning(false)
     targetEndRef.current = null
 
@@ -446,7 +484,7 @@ export default function StoodyApp() {
     }
   }
 
-  // 9. Synchronize display inputs with timeLeft
+  // 10. Synchronize display inputs with timeLeft
   useEffect(() => {
     if (engineMode !== 'stopwatch') {
       const mins = Math.floor(timeLeft / 60)
@@ -456,7 +494,7 @@ export default function StoodyApp() {
     }
   }, [timeLeft, engineMode])
 
-  // 10. Manual Digit Editing
+  // 11. Manual Digit Editing
   const handleMinuteInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (engineMode === 'pomodoro') return
     const val = e.target.value.replace(/\D/g, '').slice(0, 3)
@@ -479,11 +517,15 @@ export default function StoodyApp() {
     setCustomMinutes(Math.max(1, Math.round(newTotal / 60)))
   }
 
-  // 11. Switch Engine Modes
+  // 12. Switch Engine Modes
   const switchEngineMode = (newMode: EngineMode) => {
+    if (isRunning) {
+      flushCurrentSessionDelta()
+    }
     setIsRunning(false)
     targetEndRef.current = null
     stopwatchStartRef.current = null
+    activeRunStartRef.current = null
     setEngineMode(newMode)
 
     if (newMode === 'pomodoro') {
@@ -497,7 +539,7 @@ export default function StoodyApp() {
     }
   }
 
-  // 12. Timestamp-Driven Ticking Loop
+  // 13. Timestamp-Driven Ticking Loop
   useEffect(() => {
     if (isRunning) {
       if (engineMode === 'stopwatch') {
@@ -524,6 +566,7 @@ export default function StoodyApp() {
               } else {
                 setIsRunning(false)
                 targetEndRef.current = null
+                activeRunStartRef.current = null
                 playCompletionChime()
                 autoLogSession(customMinutes)
               }
@@ -542,30 +585,33 @@ export default function StoodyApp() {
     }
   }, [isRunning, engineMode, customMinutes, timeLeft, stopwatchElapsed, autoLogSession, handlePomodoroCompletion, playCompletionChime])
 
+  // 14. Glitch-Proof Toggle Timer
   const toggleTimer = () => {
     if (isRunning) {
+      // Transitioning to Paused: save delta and lock
       if (engineMode === 'stopwatch') {
         const mins = Math.round(stopwatchElapsed / 60)
         if (mins >= 1) autoLogSession(mins)
-      } else if (engineMode === 'timer') {
-        const plannedSeconds = customMinutes * 60
-        const elapsedSeconds = plannedSeconds - timeLeft
-        const elapsedMinutes = Math.floor(elapsedSeconds / 60)
-        if (elapsedMinutes >= 1) autoLogSession(elapsedMinutes)
-      } else if (engineMode === 'pomodoro' && pomoPhase === 'work') {
-        const elapsedMinutes = Math.floor((25 * 60 - timeLeft) / 60)
-        if (elapsedMinutes >= 1) autoLogSession(elapsedMinutes)
+      } else if (engineMode === 'timer' || (engineMode === 'pomodoro' && pomoPhase === 'work')) {
+        flushCurrentSessionDelta()
       }
       setIsRunning(false)
     } else {
+      // Transitioning to Running: stamp start time
+      activeRunStartRef.current = Date.now()
       setIsRunning(true)
     }
   }
 
   const resetTimer = () => {
+    if (isRunning) {
+      flushCurrentSessionDelta()
+    }
     setIsRunning(false)
     targetEndRef.current = null
     stopwatchStartRef.current = null
+    activeRunStartRef.current = null
+    
     if (engineMode === 'stopwatch') {
       setStopwatchElapsed(0)
     } else if (engineMode === 'pomodoro') {
@@ -577,12 +623,6 @@ export default function StoodyApp() {
     }
   }
 
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60)
-    const secs = seconds % 60
-    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
-  }
-
   const handleGoogleLogin = () => {
     supabase.auth.signInWithOAuth({
       provider: 'google',
@@ -592,7 +632,7 @@ export default function StoodyApp() {
     })
   }
 
-  // 13. Rolling Heat Map ending on Today
+  // 15. Rolling Heat Map
   const heatMapDays = useMemo(() => {
     const days: HeatMapDay[] = []
     const totalWeeks = 20
@@ -625,7 +665,7 @@ export default function StoodyApp() {
     return days
   }, [analyticsData.dailyBreakdown])
 
-  // 14. 14-Day Spline Curve
+  // 16. 14-Day Spline Curve
   const splinePath = useMemo(() => {
     const pts = analyticsData.splinePoints
     if (!pts.length) return ''
@@ -651,28 +691,15 @@ export default function StoodyApp() {
     }, '')
   }, [analyticsData.splinePoints])
 
-  // Max value calculation for 7-day bar chart
   const maxBarHours = useMemo(() => {
     const max = Math.max(...analyticsData.sevenDayBars.map(b => b.hours), 1)
     return Math.ceil(max)
   }, [analyticsData.sevenDayBars])
 
-  // Today's total minutes calculation
   const todayTotalMinutes = useMemo(() => {
     const todayStr = new Date().toISOString().split('T')[0]
     return analyticsData.dailyBreakdown[todayStr] || 0
   }, [analyticsData.dailyBreakdown])
-
-  // Dynamic document title synced with active timer
-  useEffect(() => {
-    if (isRunning) {
-      const formatted = formatTime(engineMode === 'stopwatch' ? stopwatchElapsed : timeLeft)
-      const icon = isBreakActive ? '☕ ' : ''
-      document.title = `(${formatted}) ${icon}Stoody`
-    } else {
-      document.title = 'Stoody'
-    }
-  }, [isRunning, timeLeft, stopwatchElapsed, engineMode, isBreakActive])
 
   if (authLoading) {
     return (
@@ -1051,7 +1078,7 @@ export default function StoodyApp() {
               </div>
             </div>
 
-            {/* NEW: Today at a Glance + 7-Day Bar Chart Grid */}
+            {/* Today at a Glance + 7-Day Bar Chart Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               
               {/* Card 1: Today at a Glance */}
@@ -1092,7 +1119,6 @@ export default function StoodyApp() {
                                 : 'bg-zinc-800/60 group-hover:bg-zinc-700'
                             }`}
                           />
-                          {/* Mini Hover Tooltip */}
                           <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 hidden group-hover:flex flex-col items-center pointer-events-none z-30">
                             <div className="bg-zinc-900 border border-zinc-700 text-white text-[10px] py-1 px-2 rounded-md shadow-xl whitespace-nowrap font-mono">
                               {hr % 12 === 0 ? 12 : hr % 12} {hr >= 12 ? 'PM' : 'AM'}: {mins}m
@@ -1315,7 +1341,7 @@ export default function StoodyApp() {
               </div>
             </div>
 
-            {/* NEW: Recent Sessions Activity Feed */}
+            {/* Recent Sessions Activity Feed */}
             <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-3xl p-6">
               <h3 className="text-base font-semibold text-white mb-4">Recent Sessions</h3>
               <div className="divide-y divide-zinc-800/60">
